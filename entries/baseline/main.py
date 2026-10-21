@@ -6,7 +6,6 @@ Run `python entries/baseline/main.py --help` for options and see README.md for t
 """
 
 import copy
-import csv
 import hashlib
 import json
 import math
@@ -24,7 +23,9 @@ from biotite.structure import AtomArray, filter_amino_acids, get_residue_starts
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
-from nanorfd.base import ExperimentConfig, parse_config
+from nanorfd.base import ExperimentConfig, parse_config, runtime_setting
+from nanorfd.checkpoints import load_checkpoint, restore_checkpoint, save_checkpoint
+from nanorfd.evals import evaluate
 
 
 # This entry only owns model/optimizer/diffusion choices; experiment settings come from base.
@@ -44,7 +45,7 @@ class Config(ExperimentConfig):
     sigma_max: float = 80.0
     log_sigma_mean: float = -1.2
     log_sigma_std: float = 1.2
-    rho: float = 7.0
+    rho: float = runtime_setting(7.0)
 
     def validate(self):
         super().validate()
@@ -143,6 +144,19 @@ class CATokenizer:
         if check_bonds and ((bonds < 2.5) | (bonds > 4.5)).any():
             raise ValueError(f"{sample_id}: broken chain or implausible adjacent C-alpha distance")
         return {"id": str(sample_id), "coords": coords}
+
+    @staticmethod
+    def decode(coords) -> AtomArray:
+        """Return a single-chain CA trace in angstroms; GLY is a placeholder."""
+        coords = CATokenizer.encode(coords, check_bonds=False)["coords"]
+        atoms = AtomArray(len(coords))
+        atoms.coord = coords.numpy().copy()
+        atoms.chain_id[:] = "A"
+        atoms.res_id = np.arange(1, len(coords) + 1)
+        atoms.res_name[:] = "GLY"
+        atoms.atom_name[:] = "CA"
+        atoms.element[:] = "C"
+        return atoms
 
     @staticmethod
     def to_pdb(coords, path):
@@ -405,23 +419,6 @@ def validation_loss(model, records, scale, cfg, device):
     return sum(losses) / len(losses)
 
 
-def save_checkpoint(path, model, ema, optimizer, step, rng, scale, cfg, data_hash):
-    state = {
-        "version": 1,
-        "config": asdict(cfg),
-        "model": model.state_dict(),
-        "ema": ema.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "step": step,
-        "rng": rng.get_state(),
-        "coordinate_scale": scale,
-        "data_sha256": data_hash,
-    }
-    temporary = path.with_suffix(".tmp")
-    torch.save(state, temporary)
-    temporary.replace(path)
-
-
 def train(cfg):
     started = time.monotonic()
     device = runtime(cfg)
@@ -437,41 +434,7 @@ def train(cfg):
     step = 0
     out = Path(cfg.out_dir)
     if cfg.resume:
-        state = torch.load(cfg.resume, map_location="cpu", weights_only=True)
-        if state.get("version") != 1:
-            raise ValueError("Unsupported checkpoint version")
-        mutable = {
-            "command",
-            "data",
-            "out_dir",
-            "resume",
-            "checkpoint",
-            "manifest",
-            "samples",
-            "device",
-            "threads",
-            "log_every",
-            "eval_every",
-            "eval_batches",
-            "eval_batch_size",
-            "max_minutes",
-            "length",
-            "num_samples",
-            "sample_steps",
-            "rho",
-        }
-        for key, value in asdict(cfg).items():
-            if key not in mutable and state["config"][key] != value:
-                raise ValueError(f"Resume setting changed: {key}; use the saved config")
-        if state["data_sha256"] != data_hash or state["coordinate_scale"] != scale:
-            raise ValueError("Resume dataset or normalization changed")
-        model.load_state_dict(state["model"])
-        ema.load_state_dict(state["ema"])
-        optimizer.load_state_dict(state["optimizer"])
-        rng.set_state(state["rng"])
-        step = state["step"]
-        if step >= cfg.steps:
-            raise ValueError("This checkpoint already completed the configured training steps")
+        step = restore_checkpoint(cfg.resume, model, ema, optimizer, rng, scale, cfg, data_hash)
     elif (out / "config.json").exists() or (out / "checkpoint.pt").exists():
         raise ValueError(f"Run already exists: {out}; use --resume or a new --out-dir")
     out.mkdir(parents=True, exist_ok=True)
@@ -526,63 +489,11 @@ def train(cfg):
     print(f"Checkpoint: {out / 'checkpoint.pt'}", flush=True)
 
 
-# Fast C-alpha diagnostics, not an all-atom validity or designability score.
-def geometry_metrics(record):
-    x = CATokenizer.encode(record["coords"], record["id"], check_bonds=False)["coords"]
-    bonds = x[1:] - x[:-1]
-    distances = torch.cdist(x, x)
-    index = torch.arange(len(x))
-    separation = index[None, :] - index[:, None]  # Count each unordered pair once.
-    nonlocal_pairs, distant_pairs = separation > 2, separation > 8
-    triple = (torch.cross(bonds[:-2], bonds[1:-1], dim=-1) * bonds[2:]).sum(-1)
-    norm = bonds[:-2].norm(dim=-1) * bonds[1:-1].norm(dim=-1) * bonds[2:].norm(dim=-1)
-    normal_product = torch.cross(bonds[:-2], bonds[1:-1], dim=-1).norm(dim=-1) * torch.cross(
-        bonds[1:-1], bonds[2:], dim=-1
-    ).norm(dim=-1)
-    return {
-        "id": record["id"],
-        "length": len(x),
-        "ca_distance_mean": bonds.norm(dim=-1).mean().item(),
-        "ca_distance_mae": (bonds.norm(dim=-1) - 3.8).abs().mean().item(),
-        "nonlocal_clash_fraction": ((distances < 3) & nonlocal_pairs).sum().item()
-        / max(1, nonlocal_pairs.sum().item()),
-        "contact_fraction": ((distances < 8) & distant_pairs).sum().item()
-        / max(1, distant_pairs.sum().item()),
-        "contact_pair_count": distant_pairs.sum().item(),
-        "radius_of_gyration": (x - x.mean(0)).square().sum(-1).mean().sqrt().item(),
-        "signed_volume_mean": (triple / norm.clamp_min(1e-8)).mean().item(),
-        "degenerate_triplets": (normal_product < 1e-8).sum().item(),
-    }
-
-
-def evaluate(records, out_dir):
-    if not records:
-        raise ValueError("Cannot evaluate an empty sample set")
-    rows = [geometry_metrics(record) for record in records]
-    if not all(math.isfinite(value) for row in rows for key, value in row.items() if key != "id"):
-        raise ValueError("NaN/Inf in geometry metrics")
-    summary = {"num_samples": len(rows)}
-    summary.update(
-        {key: sum(row[key] for row in rows) / len(rows) for key in rows[0] if key != "id"}
-    )
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    with (out / "geometry.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-    (out / "geometry.json").write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
-    print(json.dumps(summary), flush=True)
-    return summary
-
-
 def sample(cfg):
     if not cfg.checkpoint:
         raise ValueError("sample requires --checkpoint")
     device = runtime(cfg)
-    state = torch.load(cfg.checkpoint, map_location="cpu", weights_only=True)
-    if state.get("version") != 1:
-        raise ValueError("Unsupported checkpoint version")
+    state = load_checkpoint(cfg.checkpoint)
     trained = Config(**state["config"])
     trained.validate()
     if not trained.min_length <= cfg.length <= trained.max_length:
@@ -620,7 +531,7 @@ def sample(cfg):
     )
     for record in records:
         CATokenizer.to_pdb(record["coords"], out / f"{record['id']}.pdb")
-    evaluate(records, out)
+    evaluate({r["id"]: CATokenizer.decode(r["coords"]) for r in records}, out)
 
 
 def main(config: Config):
@@ -635,7 +546,7 @@ def main(config: Config):
     if not config.samples:
         raise ValueError("eval requires --samples (the samples.pt file)")
     records = torch.load(config.samples, map_location="cpu", weights_only=True)["samples"]
-    return evaluate(records, config.out_dir)
+    return evaluate({r["id"]: CATokenizer.decode(r["coords"]) for r in records}, config.out_dir)
 
 
 if __name__ == "__main__":

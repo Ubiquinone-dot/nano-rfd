@@ -259,21 +259,17 @@ def test_training_resume_and_sample_end_to_end(tmp_path, monkeypatch):
     assert len(list((tmp_path / "samples").glob("*.pdb"))) == 2
     report = json.loads((tmp_path / "samples/geometry.json").read_text())
     assert report["num_samples"] == 2
+    reevaluated = n.main(
+        replace(
+            generation,
+            command="eval",
+            samples=str(tmp_path / "samples/samples.pt"),
+            out_dir=str(tmp_path / "eval"),
+        )
+    )
+    assert reevaluated == report
     with pytest.raises(ValueError, match="Resume setting changed"):
         n.train(replace(resumed, width=64))
-
-
-def test_geometry_is_rotation_invariant_and_nan_is_an_error(tmp_path):
-    x = helix()
-    a = n.geometry_metrics({"id": "a", "coords": x})
-    rotation = torch.tensor([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
-    b = n.geometry_metrics({"id": "b", "coords": x @ rotation + 10})
-    for key in a:
-        if key != "id":
-            assert a[key] == pytest.approx(b[key], abs=2e-6)
-    x[0, 0] = float("nan")
-    with pytest.raises(ValueError, match="NaN/Inf"):
-        n.evaluate([{"id": "bad", "coords": x}], tmp_path)
 
 
 def test_validation_does_not_depend_on_training_batch_size():

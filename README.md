@@ -6,7 +6,8 @@ clean coordinates using an EDM objective. There are no pair features or varlen k
 
 `src/nanorfd/base.py` defines the shared `ExperimentConfig`. `entries/baseline/main.py`
 extends it with the baseline's `Config` and contains an AtomWorks tokenizer, data batching,
-the model, diffusion, training, sampling, and basic geometry evaluation. The default model
+the model, diffusion, training, and sampling. Shared evaluation and checkpoint helpers
+live alongside the base config. The default model
 has six blocks of width 256. Its generator starts from random weights.
 
 **Status:** working implementation with CPU correctness tests and a tiny synthetic
@@ -19,6 +20,8 @@ No protein dataset or trained checkpoint is bundled.
 src/nanorfd/
   __init__.py            exports ExperimentConfig
   base.py                shared experiment settings and CLI parsing
+  evals.py               AtomArray geometry metrics, aggregation, CSV/JSON reports
+  checkpoints.py         checkpoint IO and resume validation
 entries/baseline/
   main.py                Config(ExperimentConfig) and main(config)
 configs/debug.json       optional baseline overrides
@@ -171,6 +174,14 @@ batch choice, augmentation, and noise, independently of validation. Exact CPU re
 is tested; bitwise identity across devices or PyTorch versions is not promised.
 The time limit applies to each invocation. Existing runs require explicit resume.
 
+`nanorfd.checkpoints` owns version checks, atomic saves, and training-state restoration.
+The training loop resumes with one `restore_checkpoint(...)` call. Config fields must
+match by default, including fields added by future entries. Mark an operational or
+inference-only field with `runtime_setting(default)` in its dataclass definition to
+allow it to change on resume; there is no separate mutable-field list to maintain.
+This preserves the existing resume policy. A relocated dataset still needs the same
+content hash and normalization scale. Checkpoint format version 1 is unchanged.
+
 ## Sample and evaluate
 
 ```bash
@@ -183,6 +194,24 @@ checkpoint. `--sample-steps` (default 32) controls a simple Euler sampler; `--se
 `--batch-size` control reproducibility. Use the same batch size when comparing samples.
 It writes raw Cα traces as PDB files, a `samples.pt` tensor cache, `geometry.csv`, and
 `geometry.json`. GLY names in PDB output are placeholders, not designed sequences.
+
+All entries use the same evaluator, independently of their tokenizer or model:
+
+```python
+from nanorfd.evals import geometry_metrics, evaluate
+
+metrics = geometry_metrics(atom_array)  # One output -> plain numeric statistics.
+summary = evaluate({"sample_0000": atom_array}, out_dir="reports/baseline")
+```
+
+Inputs are single-chain Biotite `AtomArray`s in residue order, with coordinates in Å.
+CA-only and full-atom arrays are accepted; every amino-acid residue must contain exactly
+one carbon Cα, and each trace needs at least four residues. Nonprotein atoms are ignored.
+The baseline converts generated coordinate tensors with `CATokenizer.decode()` before
+calling this shared API. It scores bad bond lengths and collapsed structures rather
+than applying the training tokenizer's geometry filter. Omit `out_dir` to return the
+summary without writing files. The denoising validation loss remains entry-specific
+because it depends on the solution's objective and noise distribution.
 
 The geometry report includes adjacent Cα spacing/error, nonlocal Cα overlap fraction
 (distance <3 Å, sequence separation >2), radius of gyration, and contact fraction

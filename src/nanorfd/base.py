@@ -9,34 +9,44 @@ import argparse
 import json
 import math
 from dataclasses import dataclass, fields
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import TypeVar, get_type_hints
 
 
+def runtime_setting(default):
+    """A setting that may change on resume without changing training updates.
+
+    Ordinary dataclass fields (including fields added by entries) must match the
+    checkpoint. Dataset paths may move, but the checkpoint helper checks contents.
+    """
+    return dataclass_field(default=default, metadata={"resume_override": True})
+
+
 @dataclass(frozen=True, kw_only=True)
 class ExperimentConfig:
-    command: str = "train"
-    data: str = "data/ca.pt"
-    out_dir: str = "runs/default"
-    manifest: str = ""
-    checkpoint: str = ""
-    resume: str = ""
-    samples: str = ""
-    device: str = "auto"
+    command: str = runtime_setting("train")
+    data: str = runtime_setting("data/ca.pt")
+    out_dir: str = runtime_setting("runs/default")
+    manifest: str = runtime_setting("")
+    checkpoint: str = runtime_setting("")
+    resume: str = runtime_setting("")
+    samples: str = runtime_setting("")
+    device: str = runtime_setting("auto")
     seed: int = 42
-    threads: int = 4
+    threads: int = runtime_setting(4)
     bf16: bool = True  # CUDA only; CPU/MPS use float32.
     min_length: int = 4
     max_length: int = 128
     steps: int = 10000
-    max_minutes: float = 50.0  # Zero disables the training time limit.
-    log_every: int = 25
-    eval_every: int = 250
-    eval_batches: int = 4
-    eval_batch_size: int = 64
-    sample_steps: int = 32
-    length: int = 64
-    num_samples: int = 16
+    max_minutes: float = runtime_setting(50.0)  # Zero disables the training time limit.
+    log_every: int = runtime_setting(25)
+    eval_every: int = runtime_setting(250)
+    eval_batches: int = runtime_setting(4)
+    eval_batch_size: int = runtime_setting(64)
+    sample_steps: int = runtime_setting(32)
+    length: int = runtime_setting(64)
+    num_samples: int = runtime_setting(16)
 
     def validate(self):
         # Inspect the concrete subclass too, including annotations postponed by __future__.
