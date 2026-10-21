@@ -1,6 +1,6 @@
 # nanorfd: a small protein diffusion model you can understand and improve
 
-Design and implementation notes, 2026-10-21. The repository started empty. The single-script baseline is now implemented in `nanorfd.py`, with a flat `ExperimentConfig`, AtomWorks tokenizer transforms, padded attention with RoPE, EDM training, sampling, and basic geometry evaluation. CPU correctness tests cover real PDB/mmCIF loading and exact resume. No protein-quality or one-hour GPU benchmark has been run. The user selected Foundry's `long-context` branch as the structural reference and **one GPU, under an hour** as the target for the first useful training run. Sections below also describe planned research work beyond the current baseline; see README.md for what is runnable now.
+Design and implementation notes, 2026-10-21. The repository started empty. The single-script baseline is now implemented in `entries/baseline/main.py`, with a solution `Config` extending the shared `src/nanorfd/base.py` `ExperimentConfig`, AtomWorks tokenizer transforms, padded attention with RoPE, EDM training, sampling, and basic geometry evaluation. CPU correctness tests cover real PDB/mmCIF loading and exact resume. No protein-quality or one-hour GPU benchmark has been run. The user selected Foundry's `long-context` branch as the structural reference and **one GPU, under an hour** as the target for the first useful training run. Sections below also describe planned research work beyond the current baseline; see README.md for what is runnable now.
 
 ## Recommendation
 
@@ -29,7 +29,7 @@ A subagent inspected the requested `long-context` branch at commit `634efb137b31
 
 Two architecture details matter. The current [windowed coordinate autoencoder](https://github.com/baker-laboratory/foundry-dev/blob/634efb137b314eb4bc41e42e31f7c306e0f853f4/src/brm_fused/network/autoencoder.py#L1) explicitly has no equivariance. The [diffusion helpers](https://github.com/baker-laboratory/foundry-dev/blob/634efb137b314eb4bc41e42e31f7c306e0f853f4/src/brm_fused/model/fm.py#L1) implement atom37 flow matching with clean-coordinate prediction and preconditioning adapted to a linear interpolant. The proposed Gaussian EDM baseline below deliberately borrows the interface, not that exact objective; mixing the two schedules/losses would be a bug.
 
-Do not port the atom37 autoencoder, MSA/sequence/context machinery, online packing, chemistry/confidence heads, custom kernels, or cluster launch stack. In particular, tokenizer-injected flow matchers would obscure the few lines the learner needs to understand. Keep corruption, objective, and sampling together in one clearly marked section of `nanorfd.py`.
+Do not port the atom37 autoencoder, MSA/sequence/context machinery, online packing, chemistry/confidence heads, custom kernels, or cluster launch stack. In particular, tokenizer-injected flow matchers would obscure the few lines the learner needs to understand. Keep corruption, objective, and sampling together in one clearly marked section of `entries/baseline/main.py`.
 
 ## Initial task and data
 
@@ -77,23 +77,25 @@ Use padded `[B, H, L, head_dim]` Q/K/V tensors and a broadcast key-validity mask
 
 ## Repository shape and interfaces
 
-The user prefers a single-script implementation. Put the complete runnable baseline in `nanorfd.py`, with clearly ordered definitions and a small `main()` dispatcher. Keep Foundry's explicit tokenizer and experiment configuration boundaries as classes/functions inside that file. Multiple modules are unnecessary at this scale.
+Each solution lives in its own entry folder containing only `main.py`. The baseline is `entries/baseline/main.py`, with the tokenizer, model, and training workflow together. Shared `ExperimentConfig` and CLI parsing live in the installable `src/nanorfd/base.py`; each entry extends it with its own frozen `Config` dataclass and exposes `main(config)`.
 
 ```text
 README.md                 quick start, model explanation, measured reference result
 PLAN.md                   this design and unresolved decisions
 pyproject.toml            small dependency set and optional evaluation extras
-nanorfd.py                config, AtomWorks tokenizer, prepare/train/sample/eval
+src/nanorfd/base.py        shared ExperimentConfig and CLI parsing
+src/nanorfd/__init__.py    public ExperimentConfig export
+entries/baseline/main.py   entry Config, AtomWorks tokenizer, prepare/train/sample/eval
 configs/debug.json        small model and short training preset
 evaluation/designability.py  planned later inverse-fold/refold adapter
 tests/                    scientific correctness and resume tests
 ```
 
-Implemented entry points are `python nanorfd.py prepare`, `train`, `sample`, and `eval`. The preparation command reads an explicit train/validation manifest of local structure files. AtomWorks loads the first model of the asymmetric unit with its minimal parser preset. `Compose([SelectCA(), ExtractCATensor()])` then selects one amino-acid chain, validates its Cα trace, and extracts coordinate tensors. The same pipeline accepts an existing AtomArray. Dataset downloading/clustering and external refolding remain outside the core.
+Implemented entry points are `python entries/baseline/main.py prepare`, `train`, `sample`, and `eval`. The preparation command reads an explicit train/validation manifest of local structure files. AtomWorks loads the first model of the asymmetric unit with its minimal parser preset. `Compose([SelectCA(), ExtractCATensor()])` then selects one amino-acid chain, validates its Cα trace, and extracts coordinate tensors. The same pipeline accepts an existing AtomArray. Dataset downloading/clustering and external refolding remain outside the core.
 
 Estimated physical lines, including normal spacing and concise comments, for a readable baseline consuming prepared coordinates:
 
-| Section in nanorfd.py | Estimated lines |
+| Section in entries/baseline/main.py | Estimated lines |
 | --- | --- |
 | Imports, ExperimentConfig, CLI/config serialization | 60–90 |
 | Cα adapter, cache loading, batching, centering, rotations | 80–120 |
@@ -119,7 +121,7 @@ denoise(model, x_noisy, sigma, mask) -> clean_coordinate_prediction
 
 Here “tokenizer” means the mapping from residues/structure records to continuous model inputs. It is not a learned codebook or a discrete structure vocabulary. Parsing and reconstruction live at this boundary; stochastic rotation and noise have explicit owners outside it. Generated PDB residue identities must be clearly marked as placeholders, not designed sequences.
 
-Start with one flat standard-library `ExperimentConfig` dataclass, with fields grouped by data, model, diffusion, training, sampling, and evaluation. Prefer JSON overrides plus a few explicit command-line options; nested settings classes are unnecessary initially. Resolve configuration once; reject unknown keys and inconsistent dimensions; save the resolved version with every run. Construct the model/data/optimizer explicitly in `train(config)`; avoid a dependency-injection framework.
+The shared frozen `ExperimentConfig` owns data paths, seeds, device/precision, budgets, length limits, and evaluation settings. Each entry's frozen `Config(ExperimentConfig)` adds model/optimizer/diffusion fields. `Config.from_experiment(shared, **solution_settings)` preserves evaluator-supplied shared values and rejects attempts to override them as solution settings. Validation batch size is independent of the solution's training batch size. Resolve the combined flat configuration once; reject unknown keys and inconsistent dimensions; save it with every run. `main(config)` receives this object, and `train(config)` constructs components explicitly. Local CLI runs use `parse_config(Config)` for JSON and command-line overrides.
 
 Each run saves configuration, code revision (or an explicit uncommitted-source marker), dataset/split hashes, environment and device information, elapsed time, metrics, and a resumable checkpoint containing model, EMA, optimizer, scheduler, step, and RNG/data-order state. Sampling loads architecture and normalization from the checkpoint.
 

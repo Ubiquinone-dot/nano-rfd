@@ -8,6 +8,7 @@
   "warmup_steps": 10,
   "eval_every": 50,
   "eval_batches": 2,
+  "eval_batch_size": 4,
   "log_every": 25,
   "max_minutes": 0,
   "length": 16,

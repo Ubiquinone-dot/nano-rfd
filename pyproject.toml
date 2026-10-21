@@ -1,9 +1,16 @@
 [project]
 name = "nanorfd"
 version = "0.1.0"
-description = "A readable, single-script C-alpha protein diffusion model"
+description = "Small C-alpha diffusion experiments with shared evaluation settings"
 requires-python = ">=3.11"
 dependencies = ["torch>=2.6", "atomworks>=3.0.4,<4"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.9"]

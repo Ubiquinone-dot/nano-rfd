@@ -1,22 +1,66 @@
 # nanorfd
 
-A small Cα protein diffusion model in one Python script. The model is a bidirectional
+A small Cα protein diffusion model with one Python script per solution. The baseline is a bidirectional
 Transformer with RoPE, ordinary padded attention, and an MLP in each block. It predicts
 clean coordinates using an EDM objective. There are no pair features or varlen kernels.
 
-`nanorfd.py` contains `ExperimentConfig`, an AtomWorks tokenizer, data batching, the
-model, diffusion, training, sampling, and basic geometry evaluation. The default model
+`src/nanorfd/base.py` defines the shared `ExperimentConfig`. `entries/baseline/main.py`
+extends it with the baseline's `Config` and contains an AtomWorks tokenizer, data batching,
+the model, diffusion, training, sampling, and basic geometry evaluation. The default model
 has six blocks of width 256. Its generator starts from random weights.
 
 **Status:** working implementation with CPU correctness tests and a tiny synthetic
 smoke test. Protein sample quality and the one-GPU/hour target have not been benchmarked.
 No protein dataset or trained checkpoint is bundled.
 
+## Entry structure and configuration
+
+```text
+src/nanorfd/
+  __init__.py            exports ExperimentConfig
+  base.py                shared experiment settings and CLI parsing
+entries/baseline/
+  main.py                Config(ExperimentConfig) and main(config)
+configs/debug.json       optional baseline overrides
+```
+
+Each entry folder contains only `main.py`. Keep solution-specific code there and import
+shared interfaces from the installed `nanorfd` package. `uv sync` installs that package
+in editable mode, so entry scripts can import it when run directly.
+
+The base config owns data/run paths, the seed, device/precision, length limits, step/time
+budgets, and evaluation/sampling settings (including a separate `eval_batch_size`). The baseline adds its width, depth, heads,
+batch size, optimizer settings, and diffusion parameters. Both are frozen dataclasses:
+settings are resolved before a run and cannot be changed in place.
+
+An evaluator supplies one shared experiment and each entry extends it:
+
+```python
+from nanorfd.base import ExperimentConfig
+from entries.baseline.main import Config, main
+
+experiment = ExperimentConfig(data="data/ca.pt", out_dir="runs/baseline", seed=42,
+                              steps=10000, max_minutes=50)
+config = Config.from_experiment(experiment, width=256, depth=6, heads=8)
+main(config)
+```
+
+`from_experiment()` rejects attempts to override shared fields in the solution settings.
+For example, passing `seed=99` there raises an error. This is a configuration contract,
+not a sandbox for untrusted entries. `dataclasses.replace()` can construct a new config
+when the caller intentionally changes the experiment.
+
+To add an entry, define `@dataclass(frozen=True, kw_only=True) class Config(ExperimentConfig)`
+with additional primitive fields (`int`, `float`, `bool`, `str`), and implement
+`main(config: Config)`. Finish the file with `main(parse_config(Config))` inside the usual
+`if __name__ == "__main__"` guard. If overriding `validate()`, call `super().validate()`.
+There is no entry registry or evaluation runner yet.
+
 ## Setup
 
 ```bash
 uv sync --python 3.12
-uv run python nanorfd.py --help
+uv run python entries/baseline/main.py --help
 ```
 
 Dependencies are PyTorch and AtomWorks, with NumPy/Biotite supplied by AtomWorks.
@@ -46,7 +90,7 @@ splits must be nonempty. Each entry must be a complete, continuous protein chain
 the selected length range. For the intended short-domain benchmark, use 50–128 residues.
 
 ```bash
-uv run python nanorfd.py prepare --manifest manifest.json --data data/ca.pt --min-length 50
+uv run python entries/baseline/main.py prepare --manifest manifest.json --data data/ca.pt --min-length 50
 ```
 
 The tokenizer uses the actual AtomWorks backend:
@@ -70,7 +114,7 @@ author numbering; curate those explicitly upstream.
 The same pipeline accepts an already-loaded array:
 
 ```python
-from nanorfd import CATokenizer
+from entries.baseline.main import CATokenizer
 
 tokenizer = CATokenizer()
 sample = tokenizer(atom_array, sample_id="domain_a", chain="A")
@@ -86,13 +130,13 @@ fixtures; AtomWorks may print notices when those optional mirror variables are u
 
 ```bash
 # Small debugging run, using your prepared data.
-uv run python nanorfd.py train --config configs/debug.json --data data/ca.pt --out-dir runs/debug
+uv run python entries/baseline/main.py train --config configs/debug.json --data data/ca.pt --out-dir runs/debug
 
 # Initial reference settings; the runtime/quality tradeoff still needs profiling.
-uv run python nanorfd.py train --data data/ca.pt --min-length 50 --out-dir runs/baseline
+uv run python entries/baseline/main.py train --data data/ca.pt --min-length 50 --out-dir runs/baseline
 ```
 
-All settings live in one flat `ExperimentConfig`; a JSON file overrides defaults, and
+Shared and entry settings form one flat `Config`; a JSON file overrides defaults, and
 command-line options override JSON. Unknown fields and invalid dimensions fail early.
 Use `--steps`, `--batch-size`, `--width`, `--depth`, and `--heads` to shrink experiments.
 `--max-minutes 50` is the default soft training limit (checked between steps); final
@@ -118,7 +162,7 @@ Each run writes:
 Resume an interrupted run using its saved settings:
 
 ```bash
-uv run python nanorfd.py train --config runs/baseline/config.json --resume runs/baseline/checkpoint.pt
+uv run python entries/baseline/main.py train --config runs/baseline/config.json --resume runs/baseline/checkpoint.pt
 ```
 
 The data hash and training settings must match. Resume continues the original total
@@ -130,8 +174,8 @@ The time limit applies to each invocation. Existing runs require explicit resume
 ## Sample and evaluate
 
 ```bash
-uv run python nanorfd.py sample --checkpoint runs/baseline/checkpoint.pt --out-dir samples/baseline --length 64 --num-samples 16
-uv run python nanorfd.py eval --samples samples/baseline/samples.pt --out-dir samples/baseline
+uv run python entries/baseline/main.py sample --checkpoint runs/baseline/checkpoint.pt --out-dir samples/baseline --length 64 --num-samples 16
+uv run python entries/baseline/main.py eval --samples samples/baseline/samples.pt --out-dir samples/baseline
 ```
 
 Sampling loads EMA weights, architecture, normalization, and diffusion bounds from the
@@ -155,7 +199,7 @@ Cα bond lengths alone do not establish useful protein generation.
 
 ```bash
 uv run pytest -q
-uv run ruff check nanorfd.py tests
+uv run ruff check src entries tests
 ```
 
 Tests exercise real AtomWorks PDB/mmCIF loading, transform validation, chain selection,

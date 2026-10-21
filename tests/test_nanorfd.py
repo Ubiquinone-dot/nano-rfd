@@ -7,7 +7,7 @@ import torch
 from biotite.structure import AtomArray
 from biotite.structure.io.pdbx import CIFFile, set_structure
 
-import nanorfd as n
+from entries.baseline import main as n
 
 
 @pytest.fixture(autouse=True)
@@ -39,7 +39,7 @@ def atom_array(length=8):
 
 
 def tiny_config(**kwargs):
-    return n.ExperimentConfig(
+    return n.Config(
         width=32,
         depth=1,
         heads=4,
@@ -49,6 +49,7 @@ def tiny_config(**kwargs):
         warmup_steps=2,
         eval_every=4,
         eval_batches=1,
+        eval_batch_size=2,
         log_every=4,
         max_minutes=0,
         threads=1,
@@ -275,8 +276,17 @@ def test_geometry_is_rotation_invariant_and_nan_is_an_error(tmp_path):
         n.evaluate([{"id": "bad", "coords": x}], tmp_path)
 
 
+def test_validation_does_not_depend_on_training_batch_size():
+    cfg = replace(tiny_config(), eval_batch_size=3)
+    records = [n.CATokenizer.encode(helix(length), str(length)) for length in (6, 8)]
+    model = n.Denoiser(cfg)
+    first = n.validation_loss(model, records, 1.0, cfg, torch.device("cpu"))
+    second = n.validation_loss(model, records, 1.0, replace(cfg, batch_size=7), torch.device("cpu"))
+    assert first == second
+
+
 def test_config_rejects_invalid_shapes_and_unknown_fields():
     with pytest.raises(ValueError, match="head dimension"):
         replace(tiny_config(), width=30).validate()
     with pytest.raises(TypeError):
-        n.ExperimentConfig(**{**asdict(tiny_config()), "unknown": 1})
+        n.Config(**{**asdict(tiny_config()), "unknown": 1})

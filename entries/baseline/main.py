@@ -2,17 +2,16 @@
 
 The model is an ordinary bidirectional Transformer with RoPE. Coordinates are
 continuous tokens; there are no pair features, pretrained weights, or varlen kernels.
-Run `python nanorfd.py --help` for options and see README.md for the data contract.
+Run `python entries/baseline/main.py --help` for options and see README.md for the data contract.
 """
 
-import argparse
 import copy
 import csv
 import hashlib
 import json
 import math
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, replace
 from importlib.metadata import version
 from itertools import pairwise
 from pathlib import Path
@@ -25,65 +24,36 @@ from biotite.structure import AtomArray, filter_amino_acids, get_residue_starts
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
+from nanorfd.base import ExperimentConfig, parse_config
 
-# Configuration is intentionally flat. One resolved copy travels with every checkpoint.
-@dataclass
-class ExperimentConfig:
-    data: str = "data/ca.pt"
-    out_dir: str = "runs/baseline"
-    manifest: str = ""
-    checkpoint: str = ""
-    resume: str = ""
-    samples: str = ""
-    device: str = "auto"
-    seed: int = 42
-    threads: int = 4
-    min_length: int = 4
-    max_length: int = 128
+
+# This entry only owns model/optimizer/diffusion choices; experiment settings come from base.
+@dataclass(frozen=True, kw_only=True)
+class Config(ExperimentConfig):
     width: int = 256
     depth: int = 6
     heads: int = 8
     mlp_ratio: int = 4
     batch_size: int = 64
-    steps: int = 10000
     lr: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 100
     grad_clip: float = 1.0
     ema_decay: float = 0.99
-    bf16: bool = True  # CUDA only; CPU/MPS use float32.
-    max_minutes: float = 50.0  # Zero disables the training time limit.
-    log_every: int = 25
-    eval_every: int = 250
-    eval_batches: int = 4
     sigma_min: float = 0.002
     sigma_max: float = 80.0
     log_sigma_mean: float = -1.2
     log_sigma_std: float = 1.2
     rho: float = 7.0
-    sample_steps: int = 32
-    length: int = 64
-    num_samples: int = 16
 
     def validate(self):
-        for field in fields(self):
-            value = getattr(self, field.name)
-            if type(value) is not field.type and not (field.type is float and type(value) is int):
-                raise ValueError(f"{field.name} must be {field.type.__name__}")
-            if field.type is float and not math.isfinite(value):
-                raise ValueError(f"{field.name} must be finite")
+        super().validate()
         positive = (
-            "threads",
             "width",
             "depth",
             "heads",
             "mlp_ratio",
             "batch_size",
-            "steps",
-            "log_every",
-            "eval_every",
-            "eval_batches",
-            "num_samples",
             "lr",
             "grad_clip",
             "sigma_min",
@@ -95,15 +65,10 @@ class ExperimentConfig:
             raise ValueError(f"These settings must be positive: {', '.join(positive)}")
         if self.width % self.heads or (self.width // self.heads) % 2:
             raise ValueError("width must divide evenly into heads with an even head dimension")
-        if not 4 <= self.min_length <= self.max_length or self.length < 4:
-            raise ValueError("Require 4 <= min_length <= max_length and length >= 4")
-        if self.sample_steps < 2 or not self.sigma_min < self.sigma_max:
-            raise ValueError("Require sample_steps >= 2 and sigma_min < sigma_max")
-        if (
-            not 0 <= self.ema_decay < 1
-            or min(self.max_minutes, self.weight_decay, self.warmup_steps) < 0
-        ):
-            raise ValueError("Invalid EMA decay, time limit, weight decay, or warmup")
+        if not self.sigma_min < self.sigma_max:
+            raise ValueError("Require sigma_min < sigma_max")
+        if not 0 <= self.ema_decay < 1 or min(self.weight_decay, self.warmup_steps) < 0:
+            raise ValueError("Invalid EMA decay, weight decay, or warmup")
 
 
 # The tokenizer's AtomWorks pipeline selects a trace, then converts it to tensors.
@@ -432,7 +397,7 @@ def validation_loss(model, records, scale, cfg, device):
     rng = torch.Generator().manual_seed(cfg.seed + 2)
     losses = []
     for _ in range(cfg.eval_batches):
-        x, mask = make_batch(records, cfg.batch_size, scale, rng, device)
+        x, mask = make_batch(records, cfg.eval_batch_size, scale, rng, device)
         with autocast(cfg, device):
             losses.append(diffusion_loss(model, x, mask, cfg, rng).item())
     if not all(math.isfinite(loss) for loss in losses):
@@ -476,6 +441,7 @@ def train(cfg):
         if state.get("version") != 1:
             raise ValueError("Unsupported checkpoint version")
         mutable = {
+            "command",
             "data",
             "out_dir",
             "resume",
@@ -487,6 +453,7 @@ def train(cfg):
             "log_every",
             "eval_every",
             "eval_batches",
+            "eval_batch_size",
             "max_minutes",
             "length",
             "num_samples",
@@ -616,14 +583,14 @@ def sample(cfg):
     state = torch.load(cfg.checkpoint, map_location="cpu", weights_only=True)
     if state.get("version") != 1:
         raise ValueError("Unsupported checkpoint version")
-    trained = ExperimentConfig(**state["config"])
+    trained = Config(**state["config"])
     trained.validate()
     if not trained.min_length <= cfg.length <= trained.max_length:
         raise ValueError("Requested length is outside the checkpoint's configured range")
     model = Denoiser(trained).to(device).eval()
     model.load_state_dict(state["ema"])
     # The checkpoint owns diffusion units/bounds; inference controls only step count and rho.
-    trained.sample_steps, trained.rho = cfg.sample_steps, cfg.rho
+    trained = replace(trained, sample_steps=cfg.sample_steps, rho=cfg.rho)
     out = Path(cfg.out_dir)
     if (out / "samples.pt").exists():
         raise ValueError(f"Refusing to overwrite samples in {out}")
@@ -656,38 +623,20 @@ def sample(cfg):
     evaluate(records, out)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "train", "sample", "eval"))
-    parser.add_argument("--config", help="JSON ExperimentConfig overrides")
-    for field in fields(ExperimentConfig):
-        kwargs = (
-            {"action": argparse.BooleanOptionalAction}
-            if field.type is bool
-            else {"type": field.type}
-        )
-        parser.add_argument("--" + field.name.replace("_", "-"), default=None, **kwargs)
-    args = vars(parser.parse_args())
-    command, config_path = args.pop("command"), args.pop("config")
-    values = json.loads(Path(config_path).read_text()) if config_path else {}
-    values.update({key: value for key, value in args.items() if value is not None})
-    try:
-        cfg = ExperimentConfig(**values)
-        cfg.validate()
-        if command == "prepare":
-            prepare(cfg)
-        elif command == "train":
-            train(cfg)
-        elif command == "sample":
-            sample(cfg)
-        else:
-            if not cfg.samples:
-                raise ValueError("eval requires --samples (the samples.pt file)")
-            records = torch.load(cfg.samples, map_location="cpu", weights_only=True)["samples"]
-            evaluate(records, cfg.out_dir)
-    except (ValueError, TypeError) as error:
-        parser.error(str(error))
+def main(config: Config):
+    """Run this entry with a fully resolved, immutable experiment configuration."""
+    config.validate()
+    if config.command == "prepare":
+        return prepare(config)
+    if config.command == "train":
+        return train(config)
+    if config.command == "sample":
+        return sample(config)
+    if not config.samples:
+        raise ValueError("eval requires --samples (the samples.pt file)")
+    records = torch.load(config.samples, map_location="cpu", weights_only=True)["samples"]
+    return evaluate(records, config.out_dir)
 
 
 if __name__ == "__main__":
-    main()
+    main(parse_config(Config))
