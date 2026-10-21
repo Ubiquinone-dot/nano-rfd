@@ -1,6 +1,8 @@
 # nanorfd: a small protein diffusion model you can understand and improve
 
-Design and implementation notes, 2026-10-21. The repository started empty. The single-script baseline is now implemented in `entries/baseline/main.py`, with a solution `Config` extending the shared `src/nanorfd/base.py` `ExperimentConfig`, AtomWorks tokenizer transforms, padded attention with RoPE, EDM training, sampling, and shared AtomArray geometry evaluation in `src/nanorfd/evals.py`. Checkpoint IO and resume checks live in `src/nanorfd/checkpoints.py`. CPU correctness tests cover real PDB/mmCIF loading and exact resume. No protein-quality or one-hour GPU benchmark has been run. The user selected Foundry's `long-context` branch as the structural reference and **one GPU, under an hour** as the target for the first useful training run. Sections below also describe planned research work beyond the current baseline; see README.md for what is runnable now.
+Design and implementation notes, 2026-10-21. The repository started empty. The single-script baseline is now implemented in `entries/baseline/main.py`, with a solution `Config` extending the shared `src/nanorfd/base.py` `ExperimentConfig`, AtomWorks tokenizer transforms, padded attention with RoPE, EDM training, sampling, and shared AtomArray geometry evaluation in `src/nanorfd/evals.py`. Checkpoint IO and state restoration live in `src/nanorfd/checkpoints.py`. CPU correctness tests cover real PDB/mmCIF loading and exact resume. No protein-quality or one-hour GPU benchmark has been run. The user selected Foundry's `long-context` branch as the structural reference and **one GPU, under an hour** as the target for the first useful training run. Sections below also describe planned research work beyond the current baseline; see README.md for what is runnable now.
+
+Current implementation deliberately omits validation-loss calculation and custom config/data validation. The tokenizer defaults to the first protein chain when none is specified. `entries/template/main.py` supplies a TODO assignment; the broader evaluation ideas below remain future work.
 
 ## Recommendation
 
@@ -85,9 +87,10 @@ PLAN.md                   this design and unresolved decisions
 pyproject.toml            small dependency set and optional evaluation extras
 src/nanorfd/base.py        shared ExperimentConfig and CLI parsing
 src/nanorfd/evals.py       AtomArray metrics and shared report generation
-src/nanorfd/checkpoints.py checkpoint IO and resume validation
+src/nanorfd/checkpoints.py checkpoint IO and state restoration
 src/nanorfd/__init__.py    public ExperimentConfig export
 entries/baseline/main.py   entry Config, AtomWorks tokenizer, prepare/train/sample/eval
+entries/template/main.py   TODO assignment scaffold with the shared workflow supplied
 configs/debug.json        small model and short training preset
 evaluation/designability.py  planned later inverse-fold/refold adapter
 tests/                    scientific correctness and resume tests

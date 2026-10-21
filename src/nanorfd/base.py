@@ -7,86 +7,39 @@ preserve the same experiment settings across entries.
 
 import argparse
 import json
-import math
 from dataclasses import dataclass, fields
-from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import TypeVar, get_type_hints
 
 
-def runtime_setting(default):
-    """A setting that may change on resume without changing training updates.
-
-    Ordinary dataclass fields (including fields added by entries) must match the
-    checkpoint. Dataset paths may move, but the checkpoint helper checks contents.
-    """
-    return dataclass_field(default=default, metadata={"resume_override": True})
-
-
 @dataclass(frozen=True, kw_only=True)
 class ExperimentConfig:
-    command: str = runtime_setting("train")
-    data: str = runtime_setting("data/ca.pt")
-    out_dir: str = runtime_setting("runs/default")
-    manifest: str = runtime_setting("")
-    checkpoint: str = runtime_setting("")
-    resume: str = runtime_setting("")
-    samples: str = runtime_setting("")
-    device: str = runtime_setting("auto")
+    command: str = "train"
+    data: str = "data/ca.pt"
+    out_dir: str = "runs/default"
+    manifest: str = ""
+    checkpoint: str = ""
+    resume: str = ""
+    samples: str = ""
+    device: str = "auto"
     seed: int = 42
-    threads: int = runtime_setting(4)
+    threads: int = 4
     bf16: bool = True  # CUDA only; CPU/MPS use float32.
     min_length: int = 4
     max_length: int = 128
     steps: int = 10000
-    max_minutes: float = runtime_setting(50.0)  # Zero disables the training time limit.
-    log_every: int = runtime_setting(25)
-    eval_every: int = runtime_setting(250)
-    eval_batches: int = runtime_setting(4)
-    eval_batch_size: int = runtime_setting(64)
-    sample_steps: int = runtime_setting(32)
-    length: int = runtime_setting(64)
-    num_samples: int = runtime_setting(16)
-
-    def validate(self):
-        # Inspect the concrete subclass too, including annotations postponed by __future__.
-        hints = get_type_hints(type(self))
-        for field in fields(self):
-            value, expected = getattr(self, field.name), hints[field.name]
-            if type(value) is not expected and not (expected is float and type(value) is int):
-                raise ValueError(f"{field.name} must be {expected.__name__}")
-            if expected is float and not math.isfinite(value):
-                raise ValueError(f"{field.name} must be finite")
-        if self.command not in ("prepare", "train", "sample", "eval"):
-            raise ValueError("command must be prepare, train, sample, or eval")
-        positive = (
-            "threads",
-            "steps",
-            "log_every",
-            "eval_every",
-            "eval_batches",
-            "eval_batch_size",
-            "num_samples",
-        )
-        if any(getattr(self, key) <= 0 for key in positive):
-            raise ValueError(f"These settings must be positive: {', '.join(positive)}")
-        if not 4 <= self.min_length <= self.max_length or self.length < 4:
-            raise ValueError("Require 4 <= min_length <= max_length and length >= 4")
-        if self.sample_steps < 2 or self.max_minutes < 0:
-            raise ValueError("Require sample_steps >= 2 and max_minutes >= 0")
+    max_minutes: float = 50.0  # Zero disables the training time limit.
+    log_every: int = 25
+    save_every: int = 250
+    sample_steps: int = 32
+    length: int = 64
+    num_samples: int = 16
 
     @classmethod
     def from_experiment(cls, experiment, **solution_settings):
         """Extend an evaluator's settings without allowing solution overrides of shared fields."""
         shared = {field.name: getattr(experiment, field.name) for field in fields(ExperimentConfig)}
-        conflicts = shared.keys() & solution_settings.keys()
-        if conflicts:
-            raise ValueError(
-                f"Cannot override shared experiment settings: {', '.join(sorted(conflicts))}"
-            )
-        config = cls(**shared, **solution_settings)
-        config.validate()
-        return config
+        return cls(**shared, **solution_settings)
 
 
 ConfigT = TypeVar("ConfigT", bound=ExperimentConfig)
@@ -106,13 +59,6 @@ def parse_config(config_type: type[ConfigT], argv=None) -> ConfigT:
         parser.add_argument("--" + field.name.replace("_", "-"), default=None, **kwargs)
     args = vars(parser.parse_args(argv))
     config_path = args.pop("config")
-    try:
-        values = json.loads(Path(config_path).read_text()) if config_path else {}
-        if not isinstance(values, dict):
-            raise TypeError("Config JSON must be an object")
-        values.update({key: value for key, value in args.items() if value is not None})
-        config = config_type(**values)
-        config.validate()
-        return config
-    except (OSError, ValueError, TypeError) as error:
-        parser.error(str(error))
+    values = json.loads(Path(config_path).read_text()) if config_path else {}
+    values.update({key: value for key, value in args.items() if value is not None})
+    return config_type(**values)

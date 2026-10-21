@@ -19,11 +19,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from atomworks.ml.transforms.base import Compose, Transform
-from biotite.structure import AtomArray, filter_amino_acids, get_residue_starts
+from biotite.structure import AtomArray, filter_amino_acids
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
-from nanorfd.base import ExperimentConfig, parse_config, runtime_setting
+from nanorfd.base import ExperimentConfig, parse_config
 from nanorfd.checkpoints import load_checkpoint, restore_checkpoint, save_checkpoint
 from nanorfd.evals import evaluate
 
@@ -45,65 +45,17 @@ class Config(ExperimentConfig):
     sigma_max: float = 80.0
     log_sigma_mean: float = -1.2
     log_sigma_std: float = 1.2
-    rho: float = runtime_setting(7.0)
-
-    def validate(self):
-        super().validate()
-        positive = (
-            "width",
-            "depth",
-            "heads",
-            "mlp_ratio",
-            "batch_size",
-            "lr",
-            "grad_clip",
-            "sigma_min",
-            "sigma_max",
-            "log_sigma_std",
-            "rho",
-        )
-        if any(getattr(self, key) <= 0 for key in positive):
-            raise ValueError(f"These settings must be positive: {', '.join(positive)}")
-        if self.width % self.heads or (self.width // self.heads) % 2:
-            raise ValueError("width must divide evenly into heads with an even head dimension")
-        if not self.sigma_min < self.sigma_max:
-            raise ValueError("Require sigma_min < sigma_max")
-        if not 0 <= self.ema_decay < 1 or min(self.weight_decay, self.warmup_steps) < 0:
-            raise ValueError("Invalid EMA decay, weight decay, or warmup")
+    rho: float = 7.0
 
 
 # The tokenizer's AtomWorks pipeline selects a trace, then converts it to tensors.
 class SelectCA(Transform):
     def forward(self, data):
         atoms = data["atom_array"]
-        if not isinstance(atoms, AtomArray):
-            raise TypeError("Expected one AtomArray, not an ensemble/AtomArrayStack")
         atoms = atoms[filter_amino_acids(atoms)]
-        if data.get("chain") is not None:
-            atoms = atoms[atoms.chain_id == data["chain"]]
-        chains = np.unique(atoms.chain_id)
-        if len(chains) != 1:
-            raise ValueError(f"Select one protein chain; found {chains.tolist()}")
-        if (
-            "chain_iid" in atoms.get_annotation_categories()
-            and len(np.unique(atoms.chain_iid)) != 1
-        ):
-            raise ValueError("Expected one chain instance")
-        is_ca = (atoms.atom_name == "CA") & (atoms.element == "C")
-        starts = get_residue_starts(atoms)
-        if not (np.add.reduceat(is_ca.astype(int), starts) == 1).all():
-            raise ValueError("Each amino-acid residue must have exactly one CA atom")
-        ca = atoms[is_ca]
-        keys = list(zip(ca.res_id.tolist(), ca.ins_code.tolist()))
-        for previous, current in pairwise(keys):
-            delta = current[0] - previous[0]
-            if delta not in (0, 1) or (delta == 0 and current[1] <= previous[1]):
-                raise ValueError("Residue numbering gap, duplicate, or nonmonotonic order")
-        if "occupancy" in ca.get_annotation_categories() and (
-            not np.isfinite(ca.occupancy).all() or (ca.occupancy <= 0).any()
-        ):
-            raise ValueError("Unresolved CA atom or invalid occupancy")
-        return {**data, "atom_array": ca, "chain": str(chains[0])}
+        chain = data.get("chain") or str(atoms.chain_id[0])
+        ca = atoms[(atoms.chain_id == chain) & (atoms.atom_name == "CA") & (atoms.element == "C")]
+        return {**data, "atom_array": ca, "chain": chain}
 
 
 class ExtractCATensor(Transform):
@@ -134,21 +86,16 @@ class CATokenizer:
         return self(atoms, Path(path).resolve(), chain)
 
     @staticmethod
-    def encode(coords, sample_id="sample", check_bonds=True):
+    def encode(coords, sample_id="sample"):
         coords = torch.as_tensor(coords, dtype=torch.float32).detach().cpu().contiguous()
-        if coords.ndim != 2 or coords.shape[1] != 3 or len(coords) < 4:
-            raise ValueError(f"{sample_id}: expected [L, 3] coordinates with L >= 4")
         if not torch.isfinite(coords).all():
             raise ValueError(f"{sample_id}: NaN/Inf in coordinates")
-        bonds = (coords[1:] - coords[:-1]).norm(dim=-1)
-        if check_bonds and ((bonds < 2.5) | (bonds > 4.5)).any():
-            raise ValueError(f"{sample_id}: broken chain or implausible adjacent C-alpha distance")
         return {"id": str(sample_id), "coords": coords}
 
     @staticmethod
     def decode(coords) -> AtomArray:
         """Return a single-chain CA trace in angstroms; GLY is a placeholder."""
-        coords = CATokenizer.encode(coords, check_bonds=False)["coords"]
+        coords = CATokenizer.encode(coords)["coords"]
         atoms = AtomArray(len(coords))
         atoms.coord = coords.numpy().copy()
         atoms.chain_id[:] = "A"
@@ -160,9 +107,7 @@ class CATokenizer:
 
     @staticmethod
     def to_pdb(coords, path):
-        coords = CATokenizer.encode(coords, check_bonds=False)["coords"]
-        if (coords.abs() >= 1000).any() or len(coords) > 9999:
-            raise ValueError("Coordinates or residue count exceed this minimal PDB writer's limits")
+        coords = CATokenizer.encode(coords)["coords"]
         lines = ["REMARK CA TRACE ONLY; GLY IS A PLACEHOLDER, NOT A DESIGNED SEQUENCE"]
         for i, (x, y, z) in enumerate(coords.tolist(), 1):
             lines.append(
@@ -177,37 +122,9 @@ def file_hash(path):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def validate_dataset(data, cfg):
-    if data.get("version") != 1:
-        raise ValueError("Expected dataset version 1")
-    seen_ids, seen_coords = set(), set()
-    for split in ("train", "val"):
-        if not data.get(split):
-            raise ValueError(f"Dataset needs a nonempty {split} split")
-        for record in data[split]:
-            sample = CATokenizer.encode(record["coords"], record["id"])
-            if not cfg.min_length <= len(sample["coords"]) <= cfg.max_length:
-                raise ValueError(
-                    f"{sample['id']}: length outside configured range; no silent cropping"
-                )
-            # Detect literal duplicates too. Homology-aware splitting is the manifest author's job.
-            digest = hashlib.sha256(json.dumps(sample["coords"].tolist()).encode()).hexdigest()
-            if sample["id"] in seen_ids or digest in seen_coords:
-                raise ValueError(f"Duplicate structure in dataset: {sample['id']}")
-            seen_ids.add(sample["id"])
-            seen_coords.add(digest)
-            record.update(sample)
-
-
 def prepare(cfg):
-    if not cfg.manifest:
-        raise ValueError(
-            "prepare requires --manifest (JSON with explicit train/val structure entries)"
-        )
     path = Path(cfg.manifest).resolve()
     manifest = json.loads(path.read_text())
-    if set(manifest) != {"train", "val"}:
-        raise ValueError("Manifest must contain exactly train and val lists")
     data = {"version": 1, "manifest_sha256": file_hash(path)}
     tokenizer = CATokenizer()
     for split, entries in manifest.items():
@@ -217,13 +134,12 @@ def prepare(cfg):
             record = tokenizer.from_file(structure_path, entry.get("chain"))
             record["source_sha256"] = file_hash(structure_path)
             data[split].append(record)
-    validate_dataset(data, cfg)
     output = Path(cfg.data)
     if output.exists():
         raise ValueError(f"Refusing to overwrite {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(data, output)
-    print(f"Saved {len(data['train'])} train / {len(data['val'])} val structures to {output}")
+    print(f"Saved {len(data['train'])} training structures to {output}")
 
 
 def center(x, mask):
@@ -347,7 +263,7 @@ def denoise(model, x, sigma, mask):
 
 def diffusion_loss(model, x, mask, cfg, rng):
     # A dedicated CPU generator owns all stochastic training inputs, including on CUDA.
-    # Validation uses its own generator; saving this state makes batch/noise resume exact.
+    # Saving this state makes batch/noise resume exact.
     log_sigma = torch.randn(len(x), generator=rng) * cfg.log_sigma_std + cfg.log_sigma_mean
     sigma = log_sigma.exp().clamp(cfg.sigma_min, cfg.sigma_max).to(x.device)
     noise = center(torch.randn(x.shape, generator=rng).to(x.device), mask)
@@ -360,10 +276,6 @@ def diffusion_loss(model, x, mask, cfg, rng):
 @torch.no_grad()
 def sample_coordinates(model, lengths, cfg, rng, device):
     lengths = torch.as_tensor(lengths, device=device)
-    if lengths.ndim != 1 or len(lengths) == 0 or (lengths < 4).any():
-        raise ValueError("Sampling requires a nonempty list of lengths >= 4")
-    if (lengths > model.max_length).any():
-        raise ValueError("Requested length exceeds the trained maximum")
     mask = torch.arange(int(lengths.max()), device=device)[None, :] < lengths[:, None]
     x = center(torch.randn((*mask.shape, 3), generator=rng).to(device), mask) * cfg.sigma_max
     ramp = torch.linspace(0, 1, cfg.sample_steps, device=device)
@@ -387,8 +299,6 @@ def runtime(cfg):
         if cfg.device == "auto"
         else torch.device(cfg.device)
     )
-    if device.type == "cuda" and cfg.bf16 and not torch.cuda.is_bf16_supported():
-        raise ValueError("This CUDA device does not support bf16; use --no-bf16")
     return device
 
 
@@ -405,27 +315,12 @@ def learning_rate(step, cfg):
     return cfg.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress)))
 
 
-@torch.no_grad()
-def validation_loss(model, records, scale, cfg, device):
-    model.eval()
-    rng = torch.Generator().manual_seed(cfg.seed + 2)
-    losses = []
-    for _ in range(cfg.eval_batches):
-        x, mask = make_batch(records, cfg.eval_batch_size, scale, rng, device)
-        with autocast(cfg, device):
-            losses.append(diffusion_loss(model, x, mask, cfg, rng).item())
-    if not all(math.isfinite(loss) for loss in losses):
-        raise ValueError("NaN/Inf in validation loss")
-    return sum(losses) / len(losses)
-
-
 def train(cfg):
     started = time.monotonic()
     device = runtime(cfg)
     torch.manual_seed(cfg.seed)
     data_hash = file_hash(cfg.data)
     data = torch.load(cfg.data, map_location="cpu", weights_only=True)
-    validate_dataset(data, cfg)
     scale = coordinate_scale(data["train"])
     model = Denoiser(cfg).to(device)
     ema = copy.deepcopy(model).eval().requires_grad_(False)
@@ -434,7 +329,7 @@ def train(cfg):
     step = 0
     out = Path(cfg.out_dir)
     if cfg.resume:
-        step = restore_checkpoint(cfg.resume, model, ema, optimizer, rng, scale, cfg, data_hash)
+        step = restore_checkpoint(cfg.resume, model, ema, optimizer, rng)
     elif (out / "config.json").exists() or (out / "checkpoint.pt").exists():
         raise ValueError(f"Run already exists: {out}; use --resume or a new --out-dir")
     out.mkdir(parents=True, exist_ok=True)
@@ -449,7 +344,6 @@ def train(cfg):
         "coordinate_scale_angstrom": scale,
         "parameters": sum(p.numel() for p in model.parameters()),
         "train_structures": len(data["train"]),
-        "val_structures": len(data["val"]),
     }
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(json.dumps(metadata), flush=True)
@@ -473,11 +367,10 @@ def train(cfg):
         step += 1
         elapsed = time.monotonic() - started
         timed_out = cfg.max_minutes > 0 and elapsed >= cfg.max_minutes * 60
-        evaluate_now = step % cfg.eval_every == 0 or step == cfg.steps or timed_out
-        if step % cfg.log_every == 0 or evaluate_now:
+        save_now = step % cfg.save_every == 0 or step == cfg.steps or timed_out
+        if step % cfg.log_every == 0 or save_now:
             row = {"step": step, "train_loss": loss.item(), "lr": lr, "elapsed_seconds": elapsed}
-            if evaluate_now:
-                row["val_loss"] = validation_loss(ema, data["val"], scale, cfg, device)
+            if save_now:
                 save_checkpoint(
                     out / "checkpoint.pt", model, ema, optimizer, step, rng, scale, cfg, data_hash
                 )
@@ -490,14 +383,9 @@ def train(cfg):
 
 
 def sample(cfg):
-    if not cfg.checkpoint:
-        raise ValueError("sample requires --checkpoint")
     device = runtime(cfg)
     state = load_checkpoint(cfg.checkpoint)
     trained = Config(**state["config"])
-    trained.validate()
-    if not trained.min_length <= cfg.length <= trained.max_length:
-        raise ValueError("Requested length is outside the checkpoint's configured range")
     model = Denoiser(trained).to(device).eval()
     model.load_state_dict(state["ema"])
     # The checkpoint owns diffusion units/bounds; inference controls only step count and rho.
@@ -513,9 +401,7 @@ def sample(cfg):
         with autocast(cfg, device):
             coords = sample_coordinates(model, [cfg.length] * count, trained, rng, device)
         for i, x in enumerate(coords, start):
-            record = CATokenizer.encode(
-                x * state["coordinate_scale"], f"sample_{i:04d}", check_bonds=False
-            )
+            record = CATokenizer.encode(x * state["coordinate_scale"], f"sample_{i:04d}")
             records.append(record)
     torch.save(
         {
@@ -536,15 +422,12 @@ def sample(cfg):
 
 def main(config: Config):
     """Run this entry with a fully resolved, immutable experiment configuration."""
-    config.validate()
     if config.command == "prepare":
         return prepare(config)
     if config.command == "train":
         return train(config)
     if config.command == "sample":
         return sample(config)
-    if not config.samples:
-        raise ValueError("eval requires --samples (the samples.pt file)")
     records = torch.load(config.samples, map_location="cpu", weights_only=True)["samples"]
     return evaluate({r["id"]: CATokenizer.decode(r["coords"]) for r in records}, config.out_dir)
 

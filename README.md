@@ -1,63 +1,45 @@
 # nanorfd
 
-A small Cα protein diffusion model with one Python script per solution. The baseline is a bidirectional
-Transformer with RoPE, ordinary padded attention, and an MLP in each block. It predicts
-clean coordinates using an EDM objective. There are no pair features or varlen kernels.
+A small Cα protein diffusion model with one Python script per solution. The baseline
+uses a bidirectional Transformer with RoPE, ordinary padded attention, and an EDM
+clean-coordinate objective. There are no pair features or varlen kernels.
 
-`src/nanorfd/base.py` defines the shared `ExperimentConfig`. `entries/baseline/main.py`
-extends it with the baseline's `Config` and contains an AtomWorks tokenizer, data batching,
-the model, diffusion, training, and sampling. Shared evaluation and checkpoint helpers
-live alongside the base config. The default model
-has six blocks of width 256. Its generator starts from random weights.
+The implementation has CPU correctness tests and a tiny synthetic smoke test.
+Protein sample quality and the one-GPU/hour target have not been benchmarked.
+No dataset or trained checkpoint is bundled.
 
-**Status:** working implementation with CPU correctness tests and a tiny synthetic
-smoke test. Protein sample quality and the one-GPU/hour target have not been benchmarked.
-No protein dataset or trained checkpoint is bundled.
-
-## Entry structure and configuration
+## Layout
 
 ```text
 src/nanorfd/
-  __init__.py            exports ExperimentConfig
-  base.py                shared experiment settings and CLI parsing
-  evals.py               AtomArray geometry metrics, aggregation, CSV/JSON reports
-  checkpoints.py         checkpoint IO and resume validation
+  base.py                 shared ExperimentConfig and CLI parsing
+  evals.py                AtomArray geometry metrics and CSV/JSON reports
+  checkpoints.py          save/load/restore helpers
 entries/baseline/
-  main.py                Config(ExperimentConfig) and main(config)
-configs/debug.json       optional baseline overrides
+  main.py                 worked solution
+entries/template/
+  main.py                 assignment scaffold with TODO functions
+configs/debug.json        small baseline settings
 ```
 
-Each entry folder contains only `main.py`. Keep solution-specific code there and import
-shared interfaces from the installed `nanorfd` package. `uv sync` installs that package
-in editable mode, so entry scripts can import it when run directly.
-
-The base config owns data/run paths, the seed, device/precision, length limits, step/time
-budgets, and evaluation/sampling settings (including a separate `eval_batch_size`). The baseline adds its width, depth, heads,
-batch size, optimizer settings, and diffusion parameters. Both are frozen dataclasses:
-settings are resolved before a run and cannot be changed in place.
-
-An evaluator supplies one shared experiment and each entry extends it:
+Each entry folder contains only `main.py`. Both entries extend the frozen
+`ExperimentConfig` and expose `main(config)`. The base config supplies data/run paths,
+seed, device/precision, length settings, training budgets, logging/checkpoint cadence,
+and sampling settings. Entries add model, optimizer, and diffusion parameters.
 
 ```python
-from nanorfd.base import ExperimentConfig
+from nanorfd import ExperimentConfig
 from entries.baseline.main import Config, main
 
-experiment = ExperimentConfig(data="data/ca.pt", out_dir="runs/baseline", seed=42,
-                              steps=10000, max_minutes=50)
-config = Config.from_experiment(experiment, width=256, depth=6, heads=8)
-main(config)
+experiment = ExperimentConfig(data="data/ca.pt", out_dir="runs/baseline",
+                              seed=42, steps=10000, max_minutes=50)
+main(Config.from_experiment(experiment, width=256, depth=6, heads=8))
 ```
 
-`from_experiment()` rejects attempts to override shared fields in the solution settings.
-For example, passing `seed=99` there raises an error. This is a configuration contract,
-not a sandbox for untrusted entries. `dataclasses.replace()` can construct a new config
-when the caller intentionally changes the experiment.
-
-To add an entry, define `@dataclass(frozen=True, kw_only=True) class Config(ExperimentConfig)`
-with additional primitive fields (`int`, `float`, `bool`, `str`), and implement
-`main(config: Config)`. Finish the file with `main(parse_config(Config))` inside the usual
-`if __name__ == "__main__"` guard. If overriding `validate()`, call `super().validate()`.
-There is no entry registry or evaluation runner yet.
+`from_experiment()` passes shared fields directly to the entry dataclass; duplicate
+shared overrides and unknown fields fail through Python. There are no `validate()`
+methods or custom config type/range checks. JSON overrides defaults; CLI flags override
+JSON. Use `dataclasses.replace()` when deliberately constructing a changed config.
 
 ## Setup
 
@@ -67,120 +49,110 @@ uv run python entries/baseline/main.py --help
 ```
 
 Dependencies are PyTorch and AtomWorks, with NumPy/Biotite supplied by AtomWorks.
-The lockfile records the tested versions. `auto` selects CUDA if available, otherwise
-CPU; `--device mps` is explicit. CUDA uses bfloat16 autocast by default; use
-`--no-bf16` for float32. CPU and MPS run in float32. CUDA/MPS have not been tested here.
+`uv sync` installs `nanorfd` in editable mode, so entry scripts import the shared package
+directly. `auto` selects CUDA if available, otherwise CPU. CUDA uses bfloat16 autocast;
+`--no-bf16` selects float32. CPU and explicit `--device mps` use float32.
 
-## Prepare coordinates with AtomWorks
+## Assignment
 
-Make a JSON manifest of local structures with explicit train/validation splits:
+Copy `entries/template/main.py` to your own entry folder and fill in its TODOs:
+
+1. **Tokenizer:** select protein CA atoms and extract coordinate tensors through AtomWorks transforms.
+2. **Batches:** center coordinates, compute a shared scale, pad/mask, and apply proper random rotations.
+3. **Model:** implement RoPE, padded attention, Transformer blocks, and the noise-conditioned denoiser.
+4. **Diffusion:** implement EDM preconditioning and the masked training loss.
+5. **Sampling:** implement an Euler sampler ending at zero noise.
+
+Each stub documents its inputs, outputs, and mathematical contract, and raises
+`NotImplementedError` until completed. Add imports as needed. The scaffold supplies
+config/CLI, structure loading, cache/export IO, the AdamW training loop, EMA, checkpoint
+resume, and shared geometry evaluation. `entries/baseline/main.py` is the worked solution.
+Start with small settings and use the existing correctness tests as reference checks.
+
+```bash
+uv run python entries/template/main.py --help
+# After completing the TODOs:
+uv run python entries/template/main.py train --config configs/debug.json --data data/ca.pt --out-dir runs/my-entry
+```
+
+## Prepare coordinates
+
+Create a manifest of local structures. Only `train` is required; additional lists can
+be cached for later use, but training does not compute validation loss.
 
 ```json
 {
   "train": [
     {"path": "structures/domain_a.cif", "chain": "A"},
-    {"path": "structures/domain_b.pdb", "chain": "A"}
-  ],
-  "val": [
-    {"path": "structures/domain_c.cif", "chain": "B"}
+    {"path": "structures/domain_b.pdb"}
   ]
 }
 ```
 
-Paths resolve relative to the manifest. Choose related-domain/family splits upstream;
-the script checks literal duplicates but does not perform homology clustering. Both
-splits must be nonempty. Each entry must be a complete, continuous protein chain within
-the selected length range. For the intended short-domain benchmark, use 50–128 residues.
+Paths resolve relative to the manifest. Curate complete protein chains upstream; the
+baseline does not check residue numbering, occupancy, bond lengths, duplicate structures,
+or homology relationships. Length settings describe the experiment; there is no automatic
+cropping or length filtering. Short domains of 50–128 residues are the intended starting data.
 
 ```bash
-uv run python entries/baseline/main.py prepare --manifest manifest.json --data data/ca.pt --min-length 50
+uv run python entries/baseline/main.py prepare --manifest manifest.json --data data/ca.pt
 ```
 
-The tokenizer uses the actual AtomWorks backend:
+The tokenizer uses AtomWorks to parse the first model of the asymmetric unit, then:
 
 ```text
-AtomWorks parse (minimal preset, first model, asymmetric unit)
-    -> AtomArray
-    -> Compose([SelectCA(), ExtractCATensor()])
-    -> {id, coords: float32[L, 3], residue_id: int64[L]}
+AtomArray -> Compose([SelectCA(), ExtractCATensor()])
+          -> {id, coords: float32[L, 3], residue_id: int64[L]}
 ```
 
-`SelectCA` selects amino-acid residues and one chain, checks that every residue has
-exactly one carbon Cα, and checks residue order and occupancy. `ExtractCATensor`
-extracts Å coordinates and rejects nonfinite values or adjacent Cα distances outside
-2.5–4.5 Å. The pipeline does not fill missing residues, silently crop, or skip invalid
-examples. Missing atoms outside the Cα trace do not affect the model. AtomWorks handles
-PDB/mmCIF parsing and alternate locations (`first`); chain names refer to the loaded
-array's `chain_id`. The conservative numbering check can reject structures with unusual
-author numbering; curate those explicitly upstream.
-
-The same pipeline accepts an already-loaded array:
+`SelectCA` selects amino-acid carbon Cα atoms, using the requested chain or falling back
+to the first protein chain in the array. AtomWorks handles parsing and alternate locations.
+The transforms operate directly on the loaded array; there is no custom retry or repair
+layer. Missing required data fails in the normal array/transform operations. Nonfinite
+coordinates raise an error.
 
 ```python
 from entries.baseline.main import CATokenizer
 
 tokenizer = CATokenizer()
 sample = tokenizer(atom_array, sample_id="domain_a", chain="A")
-sample = tokenizer.from_file("domain_a.cif", chain="A")
+sample = tokenizer.from_file("domain_a.cif")
 ```
 
-The prepared `.pt` cache contains only tensors and plain metadata, including source
-hashes. Training reads it once, so structure parsing never runs inside an optimizer step.
-The cache must fit in CPU RAM. No CCD/PDB mirror is needed for the tested standard-residue
-fixtures; AtomWorks may print notices when those optional mirror variables are unset.
+The `.pt` cache holds tensors and plain metadata, including source hashes. Training loads
+it once into CPU RAM; structure parsing does not run inside an optimizer step.
 
-## Train
+## Train and resume
 
 ```bash
-# Small debugging run, using your prepared data.
 uv run python entries/baseline/main.py train --config configs/debug.json --data data/ca.pt --out-dir runs/debug
-
-# Initial reference settings; the runtime/quality tradeoff still needs profiling.
-uv run python entries/baseline/main.py train --data data/ca.pt --min-length 50 --out-dir runs/baseline
+uv run python entries/baseline/main.py train --data data/ca.pt --out-dir runs/baseline
 ```
 
-Shared and entry settings form one flat `Config`; a JSON file overrides defaults, and
-command-line options override JSON. Unknown fields and invalid dimensions fail early.
-Use `--steps`, `--batch-size`, `--width`, `--depth`, and `--heads` to shrink experiments.
-`--max-minutes 50` is the default soft training limit (checked between steps); final
-validation/checkpoint writing can extend it. `--max-minutes 0` disables it.
+The default model has six blocks of width 256. Training centers each structure and divides
+by a single training-set RMS coordinate scale. Proper random rotations preserve handedness.
+Padding is masked in attention and loss. RoPE describes residue order, not 3D equivariance.
 
-Training centers each structure and divides by one RMS coordinate scale computed only
-from the training set. Proper random rotations preserve handedness. Clean coordinates,
-noise, and predictions stay centered; padding is excluded from attention keys and loss.
-RoPE encodes residue order, not physical 3D rotation equivariance.
-
-The diffusion section uses `x_sigma = x_clean + sigma * noise`, EDM preconditioning
-with normalized `sigma_data=1`, and a weighted clean-coordinate MSE, averaged equally
-over proteins. Noise defaults are starting settings, not protein-calibrated optima.
 AdamW, warmup/cosine learning rate, gradient clipping, and EMA are explicit in the loop.
+`--max-minutes 50` is the default soft time limit, checked between steps; zero disables it.
+`--save-every` controls checkpoints. There is no validation-loss pass or validation dataset
+requirement. NaN/Inf losses fail, and existing run outputs require explicit resume.
 
-Each run writes:
-
-- `config.json`: fully resolved configuration.
-- `metadata.json`: source/data hashes, coordinate scale, parameter count, device, and versions.
-- `metrics.jsonl`: training loss and fixed-seed EMA validation loss.
-- `checkpoint.pt`: model, EMA, optimizer, step, configuration, scale, and training RNG state.
-
-Resume an interrupted run using its saved settings:
+Runs write resolved `config.json`, provenance `metadata.json`, training `metrics.jsonl`,
+and `checkpoint.pt` with model, EMA, optimizer, step, config, normalization, and RNG state.
 
 ```bash
 uv run python entries/baseline/main.py train --config runs/baseline/config.json --resume runs/baseline/checkpoint.pt
 ```
 
-The data hash and training settings must match. Resume continues the original total
-step schedule; it does not add `steps` more steps. A dedicated CPU generator controls
-batch choice, augmentation, and noise, independently of validation. Exact CPU resume
-is tested; bitwise identity across devices or PyTorch versions is not promised.
-The time limit applies to each invocation. Existing runs require explicit resume.
+Resume restores state with one shared helper call. Use the same dataset and training
+settings to continue the original total-step schedule. There is no custom config/hash
+compatibility validator; incompatible state-dict shapes fail in PyTorch. A dedicated CPU
+RNG controls batch choice, rotations, and noise. Exact CPU resume with unchanged settings
+is tested. The time limit applies separately to each invocation.
 
-`nanorfd.checkpoints` owns version checks, atomic saves, and training-state restoration.
-The training loop resumes with one `restore_checkpoint(...)` call. Config fields must
-match by default, including fields added by future entries. Mark an operational or
-inference-only field with `runtime_setting(default)` in its dataclass definition to
-allow it to change on resume; there is no separate mutable-field list to maintain.
-This preserves the existing resume policy. A relocated dataset still needs the same
-content hash and normalization scale. Checkpoint format version 1 is unchanged.
+The former `eval_every` option is now `save_every`; `eval_batches` and `eval_batch_size`
+have been removed. Update older saved configs to these fields before reusing them.
 
 ## Sample and evaluate
 
@@ -189,40 +161,27 @@ uv run python entries/baseline/main.py sample --checkpoint runs/baseline/checkpo
 uv run python entries/baseline/main.py eval --samples samples/baseline/samples.pt --out-dir samples/baseline
 ```
 
-Sampling loads EMA weights, architecture, normalization, and diffusion bounds from the
-checkpoint. `--sample-steps` (default 32) controls a simple Euler sampler; `--seed` and
-`--batch-size` control reproducibility. Use the same batch size when comparing samples.
-It writes raw Cα traces as PDB files, a `samples.pt` tensor cache, `geometry.csv`, and
-`geometry.json`. GLY names in PDB output are placeholders, not designed sequences.
-
-All entries use the same evaluator, independently of their tokenizer or model:
+Sampling loads EMA weights and model settings from the checkpoint. `--sample-steps`
+controls the Euler sampler. Keep seed and batch size fixed for reproducibility. Outputs
+include CA-only PDBs, `samples.pt`, and geometry reports. GLY labels are placeholders.
 
 ```python
 from nanorfd.evals import geometry_metrics, evaluate
 
-metrics = geometry_metrics(atom_array)  # One output -> plain numeric statistics.
+metrics = geometry_metrics(atom_array)
 summary = evaluate({"sample_0000": atom_array}, out_dir="reports/baseline")
 ```
 
-Inputs are single-chain Biotite `AtomArray`s in residue order, with coordinates in Å.
-CA-only and full-atom arrays are accepted; every amino-acid residue must contain exactly
-one carbon Cα, and each trace needs at least four residues. Nonprotein atoms are ignored.
-The baseline converts generated coordinate tensors with `CATokenizer.decode()` before
-calling this shared API. It scores bad bond lengths and collapsed structures rather
-than applying the training tokenizer's geometry filter. Omit `out_dir` to return the
-summary without writing files. The denoising validation loss remains entry-specific
-because it depends on the solution's objective and noise distribution.
+Supply single-chain AtomArrays in residue order with coordinates in Å and at least four
+Cα atoms. Full-atom arrays are accepted; metrics select protein carbon Cα atoms. Input
+curation is the caller's responsibility. Generated tensors become arrays through
+`CATokenizer.decode()`. All entries use the same metrics, cutoffs, and report aggregation.
 
-The geometry report includes adjacent Cα spacing/error, nonlocal Cα overlap fraction
-(distance <3 Å, sequence separation >2), radius of gyration, and contact fraction
-(distance <8 Å, sequence separation >8). Fractions count unordered pairs. A zero contact
-pair count means the contact fraction is not informative. Signed normalized triple
-products provide a crude handedness diagnostic; degenerate triplets are counted.
-Summary numbers weight samples equally. NaN/Inf samples are errors, never dropped.
-
-These are coarse diagnostics. There is no folding-based designability evaluation,
-structural novelty search, or all-atom clash score yet. A low denoising loss or plausible
-Cα bond lengths alone do not establish useful protein generation.
+Reports include Cα spacing/error, overlap fraction (distance <3 Å, sequence separation >2),
+contact fraction (distance <8 Å, separation >8), radius of gyration, signed normalized
+triple products, and degenerate-triplet counts. Pair fractions count unordered pairs;
+summary means weight samples equally. Nonfinite values raise instead of being dropped.
+These are coarse geometry diagnostics; folding-based designability is not implemented.
 
 ## Tests
 
@@ -231,9 +190,7 @@ uv run pytest -q
 uv run ruff check src entries tests
 ```
 
-Tests exercise real AtomWorks PDB/mmCIF loading, transform validation, chain selection,
-rotation augmentation, RoPE, padding isolation, sampler endpoints, finite gradients,
-exact CPU checkpoint resume, and the training/sampling/evaluation workflow. Synthetic
-helices in tests are correctness fixtures, not a protein-generation benchmark.
-
-The broader research/teaching proposal and Foundry audit are in [PLAN.md](PLAN.md).
+Tests cover AtomWorks loading, chain selection, rotations, RoPE, padding isolation,
+finite gradients, sampler endpoints, exact CPU resume, and shared geometry reports.
+Synthetic helices test correctness rather than protein-generation quality.
+The broader research proposal and Foundry audit are in [PLAN.md](PLAN.md).

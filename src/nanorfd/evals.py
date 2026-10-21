@@ -1,7 +1,7 @@
 """Fixed CA geometry diagnostics and reporting for all entries.
 
 Inputs are single-chain AtomArrays in residue order, with coordinates in angstroms.
-Full-atom arrays are also accepted: each amino-acid residue must have exactly one CA.
+Full-atom arrays are also accepted; metrics use the selected carbon CA atoms.
 These are coarse trace diagnostics, not all-atom validity or designability scores.
 """
 
@@ -12,29 +12,12 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
-from biotite.structure import AtomArray, filter_amino_acids, get_residue_starts
+from biotite.structure import AtomArray, filter_amino_acids
 
 
 def geometry_metrics(atoms: AtomArray) -> dict[str, float | int]:
     """Measure one trace, including bad bond lengths/collapses; reject invalid inputs."""
-    if not isinstance(atoms, AtomArray):
-        raise TypeError("Expected one AtomArray, not an ensemble/AtomArrayStack")
-    protein = atoms[filter_amino_acids(atoms)]
-    if len(np.unique(protein.chain_id)) != 1 or (
-        "chain_iid" in protein.get_annotation_categories()
-        and len(np.unique(protein.chain_iid)) != 1
-    ):
-        raise ValueError("Expected one protein chain")
-    is_ca = (protein.atom_name == "CA") & (protein.element == "C")
-    starts = get_residue_starts(protein)
-    if not (np.add.reduceat(is_ca.astype(int), starts) == 1).all():
-        raise ValueError("Each amino-acid residue must have exactly one CA atom")
-    ca = protein[is_ca]
-    if len(ca) < 4:
-        raise ValueError("Expected at least four CA atoms")
-    keys = list(zip(ca.res_id.tolist(), ca.ins_code.tolist()))
-    if len(set(keys)) != len(keys):
-        raise ValueError("Duplicate residues in CA trace")
+    ca = atoms[filter_amino_acids(atoms) & (atoms.atom_name == "CA") & (atoms.element == "C")]
     x = ca.coord.astype(np.float64)
     if not np.isfinite(x).all():
         raise ValueError("NaN/Inf in CA coordinates")
@@ -69,17 +52,10 @@ def geometry_metrics(atoms: AtomArray) -> dict[str, float | int]:
 def evaluate(samples: Mapping[str, AtomArray], out_dir=None) -> dict[str, float | int]:
     """Score named outputs, average equally over samples, and optionally write reports.
 
-    No samples are dropped. Invalid inputs raise with their sample ID before any
-    reports are written. Metric definitions and cutoffs are shared across entries.
+    No samples are dropped. Nonfinite values raise before reports are written.
+    Metric definitions and cutoffs are shared across entries.
     """
-    if not samples:
-        raise ValueError("Cannot evaluate an empty sample set")
-    rows = []
-    for sample_id, atoms in samples.items():
-        try:
-            rows.append({"id": sample_id, **geometry_metrics(atoms)})
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"{sample_id}: {error}") from error
+    rows = [{"id": sample_id, **geometry_metrics(atoms)} for sample_id, atoms in samples.items()]
     summary = {"num_samples": len(rows)}
     summary.update(
         {key: sum(row[key] for row in rows) / len(rows) for key in rows[0] if key != "id"}

@@ -28,7 +28,7 @@ def test_shared_config_is_independent_of_solution_settings():
     assert a.width == 64 and b.hidden_dim == 16
     with pytest.raises(FrozenInstanceError):
         a.seed = 999
-    with pytest.raises(ValueError, match="Cannot override shared.*seed"):
+    with pytest.raises(TypeError, match="seed"):
         baseline.Config.from_experiment(shared, seed=999)
     with pytest.raises(TypeError):
         baseline.Config.from_experiment(shared, nonexistent=1)
@@ -60,15 +60,8 @@ def test_entry_main_receives_config_object(monkeypatch):
     assert seen == [sampling]
 
 
-def test_invalid_shared_and_solution_config_fail_early(tmp_path):
-    with pytest.raises(ValueError, match="positive"):
-        baseline.Config.from_experiment(ExperimentConfig(steps=0))
-    with pytest.raises(ValueError, match="head dimension"):
-        baseline.Config.from_experiment(ExperimentConfig(), width=30)
-    with pytest.raises(ValueError, match="hidden_dim must be int"):
-        OtherConfig(hidden_dim="32").validate()
+def test_unknown_fields_fail_at_dataclass_construction(tmp_path):
     path = tmp_path / "unknown.json"
     path.write_text('{"not_a_setting": true}')
-    with pytest.raises(SystemExit) as error:
+    with pytest.raises(TypeError, match="not_a_setting"):
         parse_config(OtherConfig, ["train", "--config", str(path)])
-    assert error.value.code == 2

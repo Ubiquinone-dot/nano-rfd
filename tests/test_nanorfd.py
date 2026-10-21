@@ -1,5 +1,5 @@
 import json
-from dataclasses import asdict, replace
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -47,9 +47,7 @@ def tiny_config(**kwargs):
         batch_size=2,
         steps=8,
         warmup_steps=2,
-        eval_every=4,
-        eval_batches=1,
-        eval_batch_size=2,
+        save_every=4,
         log_every=4,
         max_minutes=0,
         threads=1,
@@ -76,40 +74,17 @@ def test_atomworks_pipeline_selects_ca_without_mutating_input():
     ]
 
 
-@pytest.mark.parametrize(
-    "mutation,match",
-    [
-        ("nan", "NaN/Inf"),
-        ("missing_ca", "exactly one CA"),
-        ("duplicate_ca", "exactly one CA"),
-        ("gap", "numbering gap"),
-        ("break", "broken chain"),
-        ("unresolved", "Unresolved CA"),
-    ],
-)
-def test_tokenizer_rejects_invalid_traces(mutation, match):
+def test_tokenizer_rejects_nonfinite_coordinates():
     atoms = atom_array()
-    if mutation == "nan":
-        atoms.coord[1, 0] = np.nan
-    elif mutation == "missing_ca":
-        atoms = atoms[np.arange(len(atoms)) != 4]
-    elif mutation == "duplicate_ca":
-        atoms.atom_name[0], atoms.element[0] = "CA", "C"
-    elif mutation == "gap":
-        atoms.res_id[12:] += 1
-    elif mutation == "break":
-        atoms.coord[12:] += 100
-    else:
-        atoms.occupancy[1] = 0
-    with pytest.raises(ValueError, match=match):
+    atoms.coord[1, 0] = np.nan
+    with pytest.raises(ValueError, match="NaN/Inf"):
         n.CATokenizer()(atoms)
 
 
 def test_chain_selection_and_calcium_exclusion():
     a, b = atom_array(), atom_array(6)
     b.chain_id[:] = "B"
-    with pytest.raises(ValueError, match="Select one protein chain"):
-        n.CATokenizer()(a + b)
+    torch.testing.assert_close(n.CATokenizer()(a + b)["coords"], helix())
     torch.testing.assert_close(n.CATokenizer()(a + b, chain="B")["coords"], helix(6))
     ion = AtomArray(1)
     ion.coord[:] = 0
@@ -132,21 +107,18 @@ def test_real_atomworks_file_loading(tmp_path, extension):
     torch.testing.assert_close(sample["coords"], helix(), atol=5.1e-4, rtol=0)
 
 
-def test_prepare_uses_manifest_and_rejects_leakage(tmp_path):
+def test_prepare_uses_training_only_manifest(tmp_path):
     entries = []
     for i, length in enumerate((7, 8, 9)):
         path = tmp_path / f"trace{i}.pdb"
         n.CATokenizer.to_pdb(helix(length), path)
         entries.append({"path": path.name, "chain": "A"})
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"train": entries[:2], "val": entries[2:]}))
+    manifest.write_text(json.dumps({"train": entries}))
     cfg = tiny_config(data=str(tmp_path / "data.pt"), manifest=str(manifest))
     n.prepare(cfg)
     data = torch.load(cfg.data, weights_only=True)
-    assert len(data["train"]) == 2 and len(data["val"]) == 1
-    data["val"] = [data["train"][0]]
-    with pytest.raises(ValueError, match="Duplicate structure"):
-        n.validate_dataset(data, cfg)
+    assert len(data["train"]) == 3
 
 
 def test_center_and_augmentation_preserve_distances_and_handedness():
@@ -227,7 +199,7 @@ def test_euler_endpoint_and_mask_with_oracle(monkeypatch):
 def test_training_resume_and_sample_end_to_end(tmp_path, monkeypatch):
     data_path = tmp_path / "data.pt"
     records = [n.CATokenizer.encode(helix(length), str(length)) for length in (6, 7, 8)]
-    torch.save({"version": 1, "train": records[:2], "val": records[2:]}, data_path)
+    torch.save({"version": 1, "train": records}, data_path)
     cfg = tiny_config(data=str(data_path), out_dir=str(tmp_path / "full"))
     n.train(cfg)
     reference = torch.load(tmp_path / "full/checkpoint.pt", weights_only=True)
@@ -268,21 +240,7 @@ def test_training_resume_and_sample_end_to_end(tmp_path, monkeypatch):
         )
     )
     assert reevaluated == report
-    with pytest.raises(ValueError, match="Resume setting changed"):
-        n.train(replace(resumed, width=64))
-
-
-def test_validation_does_not_depend_on_training_batch_size():
-    cfg = replace(tiny_config(), eval_batch_size=3)
-    records = [n.CATokenizer.encode(helix(length), str(length)) for length in (6, 8)]
-    model = n.Denoiser(cfg)
-    first = n.validation_loss(model, records, 1.0, cfg, torch.device("cpu"))
-    second = n.validation_loss(model, records, 1.0, replace(cfg, batch_size=7), torch.device("cpu"))
-    assert first == second
-
-
-def test_config_rejects_invalid_shapes_and_unknown_fields():
-    with pytest.raises(ValueError, match="head dimension"):
-        replace(tiny_config(), width=30).validate()
-    with pytest.raises(TypeError):
-        n.Config(**{**asdict(tiny_config()), "unknown": 1})
+    metrics = [
+        json.loads(line) for line in (tmp_path / "full/metrics.jsonl").read_text().splitlines()
+    ]
+    assert all("val_loss" not in row for row in metrics)
