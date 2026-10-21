@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import FrozenInstanceError, asdict, dataclass, fields, replace
+from dataclasses import FrozenInstanceError, dataclass, fields, replace
 
 import pytest
+import torch
 
 from entries.baseline import main as baseline
 from nanorfd import ExperimentConfig
@@ -17,7 +18,7 @@ class OtherConfig(ExperimentConfig):
 
 
 def test_shared_config_is_independent_of_solution_settings():
-    names = {field.name for field in fields(ExperimentConfig)}
+    names = {field.name for field in fields(ExperimentConfig) if field.init}
     assert {"data", "seed", "steps", "max_minutes", "sample_steps"} <= names
     assert not {"width", "heads", "lr", "sigma_min", "batch_size"} & names
     shared = ExperimentConfig(seed=7, steps=100, max_minutes=2)
@@ -43,7 +44,7 @@ def test_cli_resolves_inherited_and_extended_fields(tmp_path):
     assert type(config) is OtherConfig
     assert config.command == "sample" and config.seed == 9
     assert config.hidden_dim == 64 and config.dropout == 0.1 and config.bf16 is False
-    assert OtherConfig(**asdict(config)) == config
+    assert OtherConfig(**config.to_dict()) == config
 
 
 def test_entry_main_receives_config_object(monkeypatch):
@@ -65,3 +66,16 @@ def test_unknown_fields_fail_at_dataclass_construction(tmp_path):
     path.write_text('{"not_a_setting": true}')
     with pytest.raises(TypeError, match="not_a_setting"):
         parse_config(OtherConfig, ["train", "--config", str(path)])
+
+
+def test_config_owns_seeded_rng_without_serializing_runtime_state():
+    cfg = OtherConfig(seed=7)
+    twin = OtherConfig(seed=7)
+    assert torch.equal(torch.rand(8, generator=cfg.rng), torch.rand(8, generator=twin.rng))
+    assert cfg.rng is not twin.rng
+    settings = json.loads(json.dumps(cfg.to_dict()))
+    assert "rng" not in settings
+    assert OtherConfig(**settings) == cfg
+    changed = replace(cfg, seed=8)
+    assert changed.rng.initial_seed() == 8
+    assert "rng" not in repr(cfg)

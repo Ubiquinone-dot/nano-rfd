@@ -1,7 +1,7 @@
 """Scientific parity and lifecycle checks for the optional functional JAX entry."""
 
 import json
-from dataclasses import asdict, replace
+from dataclasses import replace
 from functools import partial
 
 import numpy as np
@@ -78,7 +78,7 @@ def test_jax_forward_and_gradients_match_torch_and_ignore_padding():
     torch.set_num_threads(1)
     torch.manual_seed(13)
     cfg = config()
-    model = torch_entry.Denoiser(torch_entry.Config(**asdict(cfg)))
+    model = torch_entry.Denoiser(torch_entry.Config(**cfg.to_dict()))
     torch.nn.init.normal_(model.output[-1].weight, std=0.1)
     params = torch_parameters(model)
     x = torch.randn(2, 6, 3)
@@ -115,7 +115,7 @@ def test_jax_rotation_and_noise_loss_are_reproducible():
     key = jax.random.PRNGKey(4)
     x = jax.random.normal(key, (2, 8, 3))
     mask = jnp.ones((2, 8), dtype=bool)
-    rotated = n.rotate(x, key)
+    rotated = n.CATokenizer.augment(x, mask, key)
     np.testing.assert_allclose(
         jnp.linalg.norm(rotated[:, :, None] - rotated[:, None, :], axis=-1),
         jnp.linalg.norm(x[:, :, None] - x[:, None, :], axis=-1),
@@ -135,7 +135,7 @@ def test_jax_rotation_and_noise_loss_are_reproducible():
 
 def test_jax_sampler_endpoint_with_oracle(monkeypatch):
     cfg = config()
-    target = n.center(
+    target = n.CATokenizer.center(
         jnp.arange(42).reshape(2, 7, 3) / 10, jnp.arange(7)[None, :] < jnp.array([4, 7])[:, None]
     )
     monkeypatch.setattr(n, "denoise", lambda params, x, sigma, mask, cfg, dtype: target)
@@ -194,13 +194,27 @@ def test_jax_training_exact_resume_and_shared_evaluation(tmp_path, monkeypatch):
     assert report["num_samples"] == 2
     assert len(list((tmp_path / "samples").glob("*.pdb"))) == 2
     eval_config = torch_entry.Config(
-        **asdict(
-            replace(
-                generation,
-                command="eval",
-                samples=str(tmp_path / "samples/samples.pt"),
-                out_dir=str(tmp_path / "eval"),
-            )
-        )
+        **replace(
+            generation,
+            command="eval",
+            samples=str(tmp_path / "samples/samples.pt"),
+            out_dir=str(tmp_path / "eval"),
+        ).to_dict()
     )
     assert torch_entry.main(eval_config) == report
+
+
+def test_jax_config_rng_and_nanometer_collation():
+    cfg = config(seed=9)
+    np.testing.assert_array_equal(cfg.rng, jax.random.PRNGKey(9))
+    np.testing.assert_array_equal(replace(cfg, seed=10).rng, jax.random.PRNGKey(10))
+    assert "rng" not in cfg.to_dict()
+    json.dumps(cfg.to_dict())
+    coords = torch.arange(18).reshape(6, 3).float()
+    records = [{"coords": coords}, {"coords": coords[:4]}]
+    x, mask = n.CATokenizer.collate(records, cfg.max_length)
+    tx, tm = torch_entry.CATokenizer.collate(records, "cpu")
+    np.testing.assert_allclose(x[:, :6], tx.numpy(), rtol=1e-6)
+    np.testing.assert_array_equal(mask[:, :6], tm.numpy())
+    assert not np.any(np.asarray(mask[:, 6:]))
+    assert np.count_nonzero(np.asarray(x[:, 6:])) == 0

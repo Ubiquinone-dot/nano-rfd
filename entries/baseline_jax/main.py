@@ -5,13 +5,11 @@ AtomWorks preprocessing and the .pt data/sample format match the PyTorch entry.
 Torch is used only for these CPU file/tokenizer boundaries, never for the model.
 """
 
-import hashlib
 import json
 import math
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
-from importlib.metadata import version
 from pathlib import Path
 
 import jax
@@ -25,8 +23,11 @@ from biotite.structure import AtomArray, filter_amino_acids
 from nanorfd.base import ExperimentConfig, parse_config
 from nanorfd.evals import evaluate
 
+##############################################
+# Experiment configuration
+##############################################
 
-# This entry only owns model/optimizer/diffusion choices; experiment settings come from base.
+
 @dataclass(frozen=True, kw_only=True)
 class Config(ExperimentConfig):
     width: int = 256
@@ -45,8 +46,17 @@ class Config(ExperimentConfig):
     log_sigma_std: float = 1.2
     rho: float = 7.0
 
+    rng: jax.Array = field(init=False, repr=False, compare=False)
 
-# The tokenizer's AtomWorks pipeline selects a trace, then converts it to tensors.
+    def __post_init__(self):
+        object.__setattr__(self, "rng", jax.random.PRNGKey(self.seed))
+
+
+##############################################
+# AtomWorks tokenizer, collation, and augmentation
+##############################################
+
+
 class SelectCA(Transform):
     def forward(self, data):
         atoms = data["atom_array"]
@@ -104,6 +114,32 @@ class CATokenizer:
         return atoms
 
     @staticmethod
+    def collate(records, max_length):
+        """Pad already-tokenized records to a fixed shape and convert angstroms to nm."""
+        x = np.zeros((len(records), max_length, 3), dtype=np.float32)
+        mask = np.zeros(x.shape[:2], dtype=bool)
+        for i, record in enumerate(records):
+            coords = np.asarray(record["coords"])
+            x[i, : len(coords)] = coords
+            mask[i, : len(coords)] = True
+        return jnp.asarray(x) / 10.0, jnp.asarray(mask)
+
+    @staticmethod
+    def center(x, mask):
+        x = jnp.where(mask[..., None], x, 0)
+        mean = x.sum(1, keepdims=True) / jnp.maximum(mask.sum(1)[:, None, None], 1)
+        return jnp.where(mask[..., None], x - mean, 0)
+
+    @classmethod
+    def augment(cls, x, mask, key):
+        """Pure centering/rotation, suitable for use inside the compiled update."""
+        x = cls.center(x, mask)
+        q, r = jnp.linalg.qr(jax.random.normal(key, (len(x), 3, 3)))
+        q = q * jnp.sign(jnp.diagonal(r, axis1=-2, axis2=-1))[:, None, :]
+        q = q.at[:, :, 0].multiply(jnp.linalg.det(q)[:, None])
+        return x @ q
+
+    @staticmethod
     def to_pdb(coords, path):
         coords = CATokenizer.encode(coords)["coords"]
         lines = ["REMARK CA TRACE ONLY; GLY IS A PLACEHOLDER, NOT A DESIGNED SEQUENCE"]
@@ -115,22 +151,21 @@ class CATokenizer:
         Path(path).write_text("\n".join([*lines, "TER", "END", ""]))
 
 
-def file_hash(path):
-    with open(path, "rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+##############################################
+# Dataset preparation
+##############################################
 
 
 def prepare(cfg):
     path = Path(cfg.manifest).resolve()
     manifest = json.loads(path.read_text())
-    data = {"version": 1, "manifest_sha256": file_hash(path)}
+    data = {"version": 1}
     tokenizer = CATokenizer()
     for split, entries in manifest.items():
         data[split] = []
         for entry in entries:
             structure_path = path.parent / entry["path"]
             record = tokenizer.from_file(structure_path, entry.get("chain"))
-            record["source_sha256"] = file_hash(structure_path)
             data[split].append(record)
     output = Path(cfg.data)
     if output.exists():
@@ -140,45 +175,11 @@ def prepare(cfg):
     print(f"Saved {len(data['train'])} training structures to {output}")
 
 
-def center(x, mask):
-    x = jnp.where(mask[..., None], x, 0)
-    mean = x.sum(1, keepdims=True) / jnp.maximum(mask.sum(1)[:, None, None], 1)
-    return jnp.where(mask[..., None], x - mean, 0)
+##############################################
+# Functional model: parameter initialization and forward passes
+##############################################
 
 
-def coordinate_scale(records):
-    total, count = 0.0, 0
-    for record in records:
-        x = np.asarray(record["coords"], dtype=np.float64)
-        total += ((x - x.mean(0)) ** 2).sum()
-        count += x.size
-    scale = float(np.sqrt(total / count))
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("Invalid training coordinate scale")
-    return scale
-
-
-def make_batch(records, cfg, scale, key):
-    # Keep the dataset on the host and transfer only a batch. Fixed L avoids retracing.
-    indices = np.asarray(jax.random.randint(key, (cfg.batch_size,), 0, len(records)))
-    x = np.zeros((cfg.batch_size, cfg.max_length, 3), dtype=np.float32)
-    mask = np.zeros(x.shape[:2], dtype=bool)
-    for i, index in enumerate(indices):
-        coords = np.asarray(records[index]["coords"])
-        x[i, : len(coords)] = coords
-        mask[i, : len(coords)] = True
-    mask = jnp.asarray(mask)
-    return center(jnp.asarray(x), mask) / scale, mask
-
-
-def rotate(x, key):
-    q, r = jnp.linalg.qr(jax.random.normal(key, (len(x), 3, 3)))
-    q = q * jnp.sign(jnp.diagonal(r, axis1=-2, axis2=-1))[:, None, :]
-    q = q.at[:, :, 0].multiply(jnp.linalg.det(q)[:, None])
-    return x @ q
-
-
-# Layers have explicit init/apply functions and ordinary dicts of float32 parameters.
 def init_linear(key, fan_in, fan_out, bias=True):
     weight_key, bias_key = jax.random.split(key)
     bound = fan_in**-0.5  # Same initialization distribution as torch.nn.Linear.
@@ -273,21 +274,31 @@ def model(params, x, noise_level, mask, cfg, dtype=jnp.float32):
     return jnp.where(mask[..., None], out, 0)
 
 
+##############################################
+# Diffusion objective
+##############################################
+
+
 def denoise(params, x, sigma, mask, cfg, dtype=jnp.float32):
     s = sigma[:, None, None]
     c_in = jax.lax.rsqrt(1 + s**2)
     raw = model(params, x * c_in, jnp.log(sigma) / 4, mask, cfg, dtype)
-    return center(x / (1 + s**2) + s * c_in * raw, mask)
+    return CATokenizer.center(x / (1 + s**2) + s * c_in * raw, mask)
 
 
 def diffusion_loss(params, x, mask, cfg, key, dtype=jnp.float32):
     sigma_key, noise_key = jax.random.split(key)
     log_sigma = jax.random.normal(sigma_key, (len(x),)) * cfg.log_sigma_std + cfg.log_sigma_mean
     sigma = jnp.clip(jnp.exp(log_sigma), cfg.sigma_min, cfg.sigma_max)
-    noise = center(jax.random.normal(noise_key, x.shape), mask)
+    noise = CATokenizer.center(jax.random.normal(noise_key, x.shape), mask)
     prediction = denoise(params, x + sigma[:, None, None] * noise, sigma, mask, cfg, dtype)
     error = jnp.where(mask[..., None], (prediction - x) ** 2, 0).sum((1, 2)) / (3 * mask.sum(1))
     return (error * (1 + sigma**2) / sigma**2).mean()
+
+
+##############################################
+# Functional optimizer and update
+##############################################
 
 
 def learning_rate(step, cfg):
@@ -305,7 +316,7 @@ def make_optimizer(cfg):
 
 
 def init_state(cfg, optimizer):
-    init_key, key = jax.random.split(jax.random.PRNGKey(cfg.seed))
+    init_key, key = jax.random.split(cfg.rng)
     params = init_model(init_key, cfg)
     return {
         "params": params,
@@ -319,7 +330,7 @@ def init_state(cfg, optimizer):
 def train_step(state, x, mask, cfg, optimizer, dtype=jnp.float32):
     """Pure update: (state, batch) -> (new state, loss, gradient norm)."""
     key, rotation_key, noise_key = jax.random.split(state["key"], 3)
-    x = rotate(x, rotation_key)
+    x = CATokenizer.augment(x, mask, rotation_key)
     loss, grads = jax.value_and_grad(diffusion_loss)(
         state["params"], x, mask, cfg, noise_key, dtype
     )
@@ -341,10 +352,15 @@ def train_step(state, x, mask, cfg, optimizer, dtype=jnp.float32):
     )
 
 
+##############################################
+# Euler sampler
+##############################################
+
+
 def sample_coordinates(params, lengths, cfg, key, dtype=jnp.float32):
     # lengths is a static tuple when JIT-compiled; scans keep the Euler loop compact.
     mask = jnp.arange(max(lengths))[None, :] < jnp.asarray(lengths)[:, None]
-    x = center(jax.random.normal(key, (*mask.shape, 3)), mask) * cfg.sigma_max
+    x = CATokenizer.center(jax.random.normal(key, (*mask.shape, 3)), mask) * cfg.sigma_max
     ramp = jnp.linspace(0, 1, cfg.sample_steps)
     schedule = (
         cfg.sigma_max ** (1 / cfg.rho)
@@ -355,16 +371,19 @@ def sample_coordinates(params, lengths, cfg, key, dtype=jnp.float32):
     def euler(x, sigmas):
         sigma, next_sigma = sigmas
         prediction = denoise(params, x, jnp.full((len(x),), sigma), mask, cfg, dtype)
-        x = center(x + (next_sigma - sigma) * (x - prediction) / sigma, mask)
+        x = CATokenizer.center(x + (next_sigma - sigma) * (x - prediction) / sigma, mask)
         return x, None
 
     x, _ = jax.lax.scan(euler, x, (schedule[:-1], schedule[1:]))
     return tuple(coords[:length] for coords, length in zip(x, lengths))
 
 
-# NPZ holds only numeric leaves and JSON. Rebuild the tree from the initialized state.
-def save_checkpoint(path, state, cfg, scale, data_hash):
-    metadata = {"config": asdict(cfg), "coordinate_scale": scale, "data_sha256": data_hash}
+##############################################
+# Checkpoint IO
+##############################################
+
+
+def save_checkpoint(path, state, cfg):
     arrays = {
         f"{name}/{i}": np.asarray(leaf)
         for name, tree in state.items()
@@ -373,15 +392,19 @@ def save_checkpoint(path, state, cfg, scale, data_hash):
     path = Path(path)
     temporary = path.with_suffix(".tmp")
     with temporary.open("wb") as handle:
-        np.savez(handle, metadata=json.dumps(metadata), **arrays)
+        np.savez(handle, config=json.dumps(cfg.to_dict()), coordinate_units="nm", **arrays)
     temporary.replace(path)
 
 
 def load_checkpoint(path):
     with np.load(path, allow_pickle=False) as archive:
-        metadata = json.loads(str(archive["metadata"]))
-        arrays = {name: archive[name] for name in archive.files if name != "metadata"}
-    return metadata, arrays
+        config = json.loads(str(archive["config"]))
+        arrays = {
+            name: archive[name]
+            for name in archive.files
+            if name not in ("config", "coordinate_units")
+        }
+    return config, arrays
 
 
 def restore_tree(arrays, name, template):
@@ -389,6 +412,11 @@ def restore_tree(arrays, name, template):
     return jax.tree.unflatten(
         structure, [jnp.asarray(arrays[f"{name}/{i}"]) for i in range(len(leaves))]
     )
+
+
+##############################################
+# Runtime and training loop
+##############################################
 
 
 def runtime(cfg):
@@ -401,9 +429,7 @@ def runtime(cfg):
 def train(cfg):
     started = time.monotonic()
     device, dtype = runtime(cfg)
-    data_hash = file_hash(cfg.data)
     records = torch.load(cfg.data, map_location="cpu", weights_only=True)["train"]
-    scale = coordinate_scale(records)
     optimizer = make_optimizer(cfg)
     state = init_state(cfg, optimizer)
     out = Path(cfg.out_dir)
@@ -413,27 +439,17 @@ def train(cfg):
     elif (out / "config.json").exists() or (out / "checkpoint.npz").exists():
         raise ValueError(f"Run already exists: {out}; use --resume or a new --out-dir")
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2) + "\n")
-    metadata = {
-        "jax": jax.__version__,
-        "optax": optax.__version__,
-        "atomworks": version("atomworks"),
-        "device": str(device),
-        "device_name": device.device_kind,
-        "dtype": str(dtype),
-        "data_sha256": data_hash,
-        "source_sha256": file_hash(__file__),
-        "coordinate_scale_angstrom": scale,
-        "train_structures": len(records),
-        "parameters": sum(p.size for p in jax.tree.leaves(state["params"])),
-    }
-    (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    print(json.dumps(metadata), flush=True)
+    (out / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2) + "\n")
+    parameters = sum(p.size for p in jax.tree.leaves(state["params"]))
+    print(f"Device: {device} | Parameters: {parameters:,}", flush=True)
     step_fn = jax.jit(partial(train_step, cfg=cfg, optimizer=optimizer, dtype=dtype))
     step = int(state["step"])
+    tokenizer = CATokenizer()
     while step < cfg.steps:
         batch_key, key = jax.random.split(state["key"])
-        x, mask = make_batch(records, cfg, scale, batch_key)
+        indices = np.asarray(jax.random.randint(batch_key, (cfg.batch_size,), 0, len(records)))
+        batch = [records[i] for i in indices]
+        x, mask = tokenizer.collate(batch, cfg.max_length)
         state, loss, grad_norm = step_fn({**state, "key": key}, x, mask)
         loss, grad_norm = float(loss), float(grad_norm)  # Synchronize before timing/checkpointing.
         if not math.isfinite(loss) or not math.isfinite(grad_norm):
@@ -450,7 +466,7 @@ def train(cfg):
                 "elapsed_seconds": elapsed,
             }
             if save_now:
-                save_checkpoint(out / "checkpoint.npz", state, cfg, scale, data_hash)
+                save_checkpoint(out / "checkpoint.npz", state, cfg)
             with (out / "metrics.jsonl").open("a") as handle:
                 handle.write(json.dumps(row, allow_nan=False) + "\n")
             print(json.dumps(row), flush=True)
@@ -459,11 +475,16 @@ def train(cfg):
     print(f"Checkpoint: {out / 'checkpoint.npz'}", flush=True)
 
 
+##############################################
+# Generation and shared evaluation
+##############################################
+
+
 def sample(cfg):
     _, dtype = runtime(cfg)
-    metadata, arrays = load_checkpoint(cfg.checkpoint)
-    trained = Config(**metadata["config"])
-    params = restore_tree(arrays, "ema", init_model(jax.random.PRNGKey(0), trained))
+    settings, arrays = load_checkpoint(cfg.checkpoint)
+    trained = Config(**settings)
+    params = restore_tree(arrays, "ema", init_model(trained.rng, trained))
     trained = replace(trained, sample_steps=cfg.sample_steps, rho=cfg.rho)
     sampler = jax.jit(
         partial(sample_coordinates, cfg=trained, dtype=dtype), static_argnames=("lengths",)
@@ -472,23 +493,20 @@ def sample(cfg):
     if (out / "samples.pt").exists():
         raise ValueError(f"Refusing to overwrite samples in {out}")
     out.mkdir(parents=True, exist_ok=True)
-    key = jax.random.PRNGKey(cfg.seed)
+    key = cfg.rng
     records = []
     for start in range(0, cfg.num_samples, cfg.batch_size):
         count = min(cfg.batch_size, cfg.num_samples - start)
         key, sample_key = jax.random.split(key)
         coords = sampler(params, lengths=(cfg.length,) * count, key=sample_key)
         for i, x in enumerate(coords, start):
-            record = CATokenizer.encode(
-                np.array(x) * metadata["coordinate_scale"], f"sample_{i:04d}"
-            )
+            record = CATokenizer.encode(np.array(x) * 10.0, f"sample_{i:04d}")
             records.append(record)
     torch.save(
         {
             "version": 1,
             "samples": records,
             "seed": cfg.seed,
-            "checkpoint_sha256": file_hash(cfg.checkpoint),
             "sample_steps": cfg.sample_steps,
             "rho": cfg.rho,
             "batch_size": cfg.batch_size,
@@ -498,6 +516,11 @@ def sample(cfg):
     for record in records:
         CATokenizer.to_pdb(record["coords"], out / f"{record['id']}.pdb")
     return evaluate({r["id"]: CATokenizer.decode(r["coords"]) for r in records}, out)
+
+
+##############################################
+# Entry point
+##############################################
 
 
 def main(config: Config):

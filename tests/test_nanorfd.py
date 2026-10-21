@@ -126,10 +126,10 @@ def test_center_and_augmentation_preserve_distances_and_handedness():
     mask = torch.ones(1, 8, dtype=torch.bool)
     translated = torch.cat((x + 100, torch.full((1, 3, 3), 999.0)), dim=1)
     padded_mask = torch.cat((mask, torch.zeros(1, 3, dtype=torch.bool)), dim=1)
-    actual = n.center(translated, padded_mask)
+    actual = n.CATokenizer.center(translated, padded_mask)
     torch.testing.assert_close(actual[:, :8], x - x.mean(1, keepdim=True), atol=1e-5, rtol=0)
     assert actual[:, 8:].count_nonzero() == 0
-    rotated, _ = n.make_batch([{"coords": x[0]}], 1, 1.0, torch.Generator().manual_seed(1), "cpu")
+    rotated = n.CATokenizer.augment(x, mask, tiny_config(seed=1))
     torch.testing.assert_close(torch.cdist(rotated, rotated), torch.cdist(x, x))
     original_volume = torch.linalg.det(x[0, 1:4] - x[0, 0])
     rotated_volume = torch.linalg.det(rotated[0, 1:4] - rotated[0, 0])
@@ -161,9 +161,7 @@ def test_padding_cannot_change_real_predictions_and_loss_has_gradients():
     padded_prediction = n.denoise(model, padded_x, sigma, padded_mask)
     torch.testing.assert_close(prediction, padded_prediction[:, :8], atol=1e-6, rtol=1e-5)
     assert padded_prediction[:, 8:].count_nonzero() == 0
-    loss = n.diffusion_loss(
-        model, n.center(padded_x, padded_mask), padded_mask, cfg, torch.Generator().manual_seed(3)
-    )
+    loss = n.diffusion_loss(model, n.CATokenizer.center(padded_x, padded_mask), padded_mask, cfg)
     loss.backward()
     assert torch.isfinite(loss)
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
@@ -176,21 +174,19 @@ def pad_mask(mask, count):
 def test_euler_endpoint_and_mask_with_oracle(monkeypatch):
     cfg = tiny_config()
     seen = []
-    target = n.center(
+    target = n.CATokenizer.center(
         torch.arange(42).reshape(2, 7, 3).float() / 10,
         torch.arange(7)[None, :] < torch.tensor([4, 7])[:, None],
     )
 
     def oracle(model, x, sigma, mask):
         assert (sigma > 0).all()  # The zero endpoint must not be fed through log(sigma).
-        torch.testing.assert_close(x, n.center(x, mask), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(x, n.CATokenizer.center(x, mask), atol=1e-5, rtol=1e-5)
         seen.append(sigma[0].item())
         return target
 
     monkeypatch.setattr(n, "denoise", oracle)
-    samples = n.sample_coordinates(
-        n.Denoiser(cfg), [4, 7], cfg, torch.Generator().manual_seed(2), torch.device("cpu")
-    )
+    samples = n.sample_coordinates(n.Denoiser(cfg), [4, 7], cfg, torch.device("cpu"))
     assert len(seen) == cfg.sample_steps
     torch.testing.assert_close(samples[0], target[0, :4], atol=1e-5, rtol=0)
     torch.testing.assert_close(samples[1], target[1], atol=1e-5, rtol=0)
@@ -226,8 +222,23 @@ def test_training_resume_and_sample_end_to_end(tmp_path, monkeypatch):
             torch.testing.assert_close(reference[group][key], actual[group][key], rtol=0, atol=0)
     assert torch.equal(reference["rng"], actual["rng"])
     assert actual["step"] == cfg.steps
+    assert actual["coordinate_units"] == "nm"
+    assert "rng" not in actual["config"]
+    assert not (tmp_path / "full/metadata.json").exists()
     generation = replace(cfg, checkpoint=resumed.resume, out_dir=str(tmp_path / "samples"))
+    outputs_nm = []
+    original_sampler = n.sample_coordinates
+
+    def capture_samples(*args):
+        coords = original_sampler(*args)
+        outputs_nm.extend(coords)
+        return coords
+
+    monkeypatch.setattr(n, "sample_coordinates", capture_samples)
     n.sample(generation)
+    saved = torch.load(tmp_path / "samples/samples.pt", weights_only=True)["samples"]
+    for record, coords_nm in zip(saved, outputs_nm):
+        torch.testing.assert_close(record["coords"], coords_nm * 10)
     assert len(list((tmp_path / "samples").glob("*.pdb"))) == 2
     report = json.loads((tmp_path / "samples/geometry.json").read_text())
     assert report["num_samples"] == 2
@@ -244,3 +255,16 @@ def test_training_resume_and_sample_end_to_end(tmp_path, monkeypatch):
         json.loads(line) for line in (tmp_path / "full/metrics.jsonl").read_text().splitlines()
     ]
     assert all("val_loss" not in row for row in metrics)
+
+
+def test_collation_only_pads_and_converts_angstroms_to_nanometers():
+    records = [n.CATokenizer.encode(helix(length), str(length)) for length in (6, 8)]
+    originals = [r["coords"].clone() for r in records]
+    x, mask = n.CATokenizer.collate(records, "cpu")
+    assert mask.sum(1).tolist() == [6, 8]
+    for i, original in enumerate(originals):
+        torch.testing.assert_close(x[i, : len(original)], original / 10)
+        torch.testing.assert_close(records[i]["coords"], original)
+    assert x[0, 6:].count_nonzero() == 0
+    # Collation does not center or rotate the selected records.
+    assert x[1, :, 2].mean() > 0

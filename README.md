@@ -43,6 +43,12 @@ shared overrides and unknown fields fail through Python. There are no `validate(
 methods or custom config type/range checks. JSON overrides defaults; CLI flags override
 JSON. Use `dataclasses.replace()` when deliberately constructing a changed config.
 
+`ExperimentConfig.__post_init__()` creates `cfg.rng` from `cfg.seed`. PyTorch helpers
+use that generator directly. The JAX config creates a starting PRNG key instead;
+functional updates return the advanced key in training state. `cfg.to_dict()` serializes
+only settings, leaving runtime RNG objects out of JSON and CLI options. Constructing or
+replacing a config creates a fresh RNG; resuming restores its saved state.
+
 ## Setup
 
 ```bash
@@ -88,7 +94,7 @@ then run `.venv/bin/python entries/baseline_jax/main.py ... --device cuda` in th
 environment. `--device cpu`, `--device gpu`, and `--device auto` are also supported.
 This entry has been tested on CPU; GPU throughput and the one-hour target remain unmeasured.
 
-JAX checkpoints are `checkpoint.npz`, containing numeric tree leaves and JSON metadata.
+JAX checkpoints are `checkpoint.npz`, containing numeric tree leaves, config JSON, and a unit label.
 Resume with the same dataset, configuration, and library versions:
 
 ```bash
@@ -105,7 +111,7 @@ Exact interrupted/resumed CPU training is tested independently for both.
 Copy `entries/template/main.py` to your own entry folder and fill in its TODOs:
 
 1. **Tokenizer:** select protein CA atoms and extract coordinate tensors through AtomWorks transforms.
-2. **Batches:** center coordinates, compute a shared scale, pad/mask, and apply proper random rotations.
+2. **Batches:** collate selected records, convert Å to nm, then center and apply proper random rotations.
 3. **Model:** implement RoPE, padded attention, Transformer blocks, and the noise-conditioned denoiser.
 4. **Diffusion:** implement EDM preconditioning and the masked training loss.
 5. **Sampling:** implement an Euler sampler ending at zero noise.
@@ -166,8 +172,20 @@ sample = tokenizer(atom_array, sample_id="domain_a", chain="A")
 sample = tokenizer.from_file("domain_a.cif")
 ```
 
-The `.pt` cache holds tensors and plain metadata, including source hashes. Training loads
-it once into CPU RAM; structure parsing does not run inside an optimizer step.
+The `.pt` cache holds IDs and coordinate/residue tensors in angstroms. Training loads it
+once into CPU RAM; structure parsing does not run inside an optimizer step.
+
+The training loop selects records explicitly. The tokenizer then handles two distinct steps:
+
+```python
+x_nm, mask = tokenizer.collate(records, device)  # Pad and divide angstroms by 10.
+x_nm = tokenizer.augment(x_nm, mask, cfg)       # Center and rotate using cfg.rng.
+```
+
+For JAX, `collate(records, max_length)` pads to a fixed shape, and the compiled update
+calls `augment(x_nm, mask, key)` with an explicit subkey. `center()` is also a tokenizer
+method, reused to center diffusion noise and predictions. Neither collation nor
+augmentation selects records or reparses structures.
 
 ## Train and resume
 
@@ -176,8 +194,10 @@ uv run python entries/baseline/main.py train --config configs/debug.json --data 
 uv run python entries/baseline/main.py train --data data/ca.pt --out-dir runs/baseline
 ```
 
-The default model has six blocks of width 256. Training centers each structure and divides
-by a single training-set RMS coordinate scale. Proper random rotations preserve handedness.
+The default model has six blocks of width 256. Model coordinates are in nanometers:
+collation divides Å by 10, and sampling multiplies nm by 10 before saving/exporting.
+There is no fitted coordinate scale. EDM uses `sigma_data=1 nm`; noise settings are also
+in nm. Proper random rotations preserve handedness.
 Padding is masked in attention and loss. RoPE describes residue order, not 3D equivariance.
 
 AdamW, warmup/cosine learning rate, gradient clipping, and EMA are explicit in the loop.
@@ -185,8 +205,9 @@ AdamW, warmup/cosine learning rate, gradient clipping, and EMA are explicit in t
 `--save-every` controls checkpoints. There is no validation-loss pass or validation dataset
 requirement. NaN/Inf losses fail, and existing run outputs require explicit resume.
 
-Runs write resolved `config.json`, provenance `metadata.json`, training `metrics.jsonl`,
-and `checkpoint.pt` with model, EMA, optimizer, step, config, normalization, and RNG state.
+Runs write resolved `config.json`, training `metrics.jsonl`, and `checkpoint.pt` with
+model, EMA, optimizer, step, config, RNG state, and the `nm` unit label. Startup prints
+only device and parameter count. There is no separate metadata dump or source/data hashing.
 
 ```bash
 uv run python entries/baseline/main.py train --config runs/baseline/config.json --resume runs/baseline/checkpoint.pt
@@ -200,6 +221,8 @@ is tested. The time limit applies separately to each invocation.
 
 The former `eval_every` option is now `save_every`; `eval_batches` and `eval_batch_size`
 have been removed. Update older saved configs to these fields before reusing them.
+Prepared datasets remain in Å and are reusable. Retrain checkpoints from the old
+RMS-scaled version: their learned coordinate units differ from the nanometer baseline.
 
 ## Sample and evaluate
 

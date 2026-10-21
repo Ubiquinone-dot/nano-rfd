@@ -14,6 +14,10 @@ from pathlib import Path
 import numpy as np
 from biotite.structure import AtomArray, filter_amino_acids
 
+##############################################
+# Geometry metrics
+##############################################
+
 
 def geometry_metrics(atoms: AtomArray) -> dict[str, float | int]:
     """Measure one trace, including bad bond lengths/collapses; reject invalid inputs."""
@@ -47,6 +51,11 @@ def geometry_metrics(atoms: AtomArray) -> dict[str, float | int]:
     if not all(math.isfinite(value) for value in metrics.values()):
         raise ValueError("NaN/Inf in geometry metrics")
     return metrics
+
+
+##############################################
+# Shared evaluation and reports
+##############################################
 
 
 def evaluate(samples: Mapping[str, AtomArray], out_dir=None) -> dict[str, float | int]:

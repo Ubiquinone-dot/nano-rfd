@@ -4,6 +4,8 @@ Design and implementation notes, 2026-10-21. The repository started empty. The s
 
 The functional JAX counterpart is implemented in `entries/baseline_jax/main.py`, with explicit parameter/RNG/optimizer trees, JIT updates, and a scan-based sampler. CPU tests cover PyTorch forward/gradient parity and exact JAX resume; GPU performance remains unmeasured.
 
+Configs now own seeded RNG initialization. Tokenizers separate collation (padding plus Å-to-nm conversion) from centering/rotation. Training uses nanometers without a fitted scale; exports and shared geometry evaluation remain in Å. Run artifacts are limited to config, training log, and checkpoint.
+
 Current implementation deliberately omits validation-loss calculation and custom config/data validation. The tokenizer defaults to the first protein chain when none is specified. `entries/template/main.py` supplies a TODO assignment; the broader evaluation ideas below remain future work.
 
 ## Recommendation
@@ -41,7 +43,7 @@ Do not port the atom37 autoencoder, MSA/sequence/context machinery, online packi
 - Train on complete, contiguous short domains. Random fragments of large proteins are useful for debugging, but should not define a benchmark claiming to generate complete domains.
 - Candidate starting corpus: a pinned, cleaned subset of SCOPe domains, following the kind of data preparation used by [Genie](https://github.com/aqlaboratory/genie). The first implementation milestone must establish the available counts and actual download/preparation cost. Do not invent a required dataset size before inspecting the corpus.
 - Publish an immutable manifest with source/version, structure and chain/domain identifiers, residue ranges, cluster membership, split, and checksums. Split related domains together, preferably by supplied structural superfamily; explain exactly what the split does and does not exclude. Never split crops from the same parent across train and validation.
-- Choose train/validation/test splits before selecting examples or fitting normalization. Reserve the test split for the final report.
+- Choose train/validation/test splits before selecting examples. Reserve the test split for the final report.
 - Validate finite coordinates, residue ordering, alternate-location handling, missing Cα atoms, and chain continuity. Log every exclusion with a reason. Raise on NaNs instead of silently filtering them. Do not concatenate across gaps and pretend the endpoints are bonded.
 - Cache coordinates and metadata once. Parsing PDB/mmCIF files belongs in preparation, not the training loop. Publish a tiny debug fixture and a reproducible preparation script; distribution of a prepared corpus depends on its source terms.
 - Store sequence for provenance/clustering if available, but do not expose it as model conditioning in this benchmark.
@@ -66,7 +68,7 @@ The diffusion design is informed by [EDM](https://arxiv.org/abs/2206.00364), but
 
 Important implementation details:
 
-- Compute one global coordinate scale from training data and save it. Do not normalize each structure to unit radius, which would erase physical size variation. Convert back to Å for exported structures and metrics.
+- Convert cached Å coordinates to nm by dividing by 10 during collation. Do not fit a dataset scale or normalize each structure to unit radius. Convert sampled nm coordinates back to Å for export and metrics.
 - For valid residues, subtract the centroid from both clean coordinates and sampled Gaussian noise. Keep padded entries zero. Use the same centered subspace during sampling.
 - Corrupt with `x_sigma = x_0 + sigma * epsilon`. Define the EDM preconditioning, noise distribution, and loss weights in one place, with matching sampler conventions.
 - Apply the same proper rotation to all coordinates in an example. Do not augment by reflections, since handedness matters.
@@ -122,16 +124,17 @@ The proposed data contract is deliberately small:
 CATokenizer()(atom_array, sample_id, chain) -> {id, coords, residue_id}
 CATokenizer().from_file(path, chain) -> {id, coords, residue_id}
 CATokenizer.to_pdb(coords, path)  # Cα-only placeholder residues
-make_batch(...) -> (coords, mask)  # padded [B, L, 3], [B, L]
+CATokenizer.collate(records, device) -> (coords_nm, mask)  # pad + Å / 10
+CATokenizer.augment(coords_nm, mask, cfg) -> centered_rotated_coords_nm
 Denoiser.forward(x_preconditioned, noise_level, mask) -> residual
 denoise(model, x_noisy, sigma, mask) -> clean_coordinate_prediction
 ```
 
-Here “tokenizer” means the mapping from residues/structure records to continuous model inputs. It is not a learned codebook or a discrete structure vocabulary. Parsing and reconstruction live at this boundary; stochastic rotation and noise have explicit owners outside it. Generated PDB residue identities must be clearly marked as placeholders, not designed sequences.
+Here “tokenizer” means the mapping from residues/structure records to continuous model inputs. It is not a learned codebook or a discrete structure vocabulary. Parsing, reconstruction, collation, and coordinate augmentation live at this boundary. Diffusion noise stays in the loss/sampler. Generated PDB residue identities must be clearly marked as placeholders, not designed sequences.
 
-The shared frozen `ExperimentConfig` owns data paths, seeds, device/precision, budgets, length limits, and evaluation settings. Each entry's frozen `Config(ExperimentConfig)` adds model/optimizer/diffusion fields. `Config.from_experiment(shared, **solution_settings)` preserves evaluator-supplied shared values and rejects attempts to override them as solution settings. Validation batch size is independent of the solution's training batch size. Resolve the combined flat configuration once; reject unknown keys and inconsistent dimensions; save it with every run. `main(config)` receives this object, and `train(config)` constructs components explicitly. Local CLI runs use `parse_config(Config)` for JSON and command-line overrides.
+The shared frozen `ExperimentConfig` owns data paths, seed, device/precision, budgets, length settings, and a runtime RNG initialized in `__post_init__`. Each entry extends it with model/optimizer/diffusion fields. `to_dict()` serializes settings without runtime state. JAX overrides RNG initialization with a PRNG key and threads updated keys through functional training state. `main(config)` receives the resolved object; local CLI runs use `parse_config(Config)`.
 
-Each run saves configuration, code revision (or an explicit uncommitted-source marker), dataset/split hashes, environment and device information, elapsed time, metrics, and a resumable checkpoint containing model, EMA, optimizer, scheduler, step, and RNG/data-order state. Sampling loads architecture and normalization from the checkpoint.
+Each run saves resolved config, training metrics, and a resumable checkpoint containing parameters, EMA, optimizer, step, and RNG state. Startup prints device and parameter count. There is no comprehensive metadata dump, dataset hashing, or coordinate-scale fitting. Sampling loads the architecture from the checkpoint and converts nm outputs back to Å.
 
 ## What “under an hour” means
 

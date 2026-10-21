@@ -6,12 +6,10 @@ Run `python entries/baseline/main.py --help` for options and see README.md for t
 """
 
 import copy
-import hashlib
 import json
 import math
 import time
-from dataclasses import asdict, dataclass, replace
-from importlib.metadata import version
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from pathlib import Path
 
@@ -27,8 +25,11 @@ from nanorfd.base import ExperimentConfig, parse_config
 from nanorfd.checkpoints import load_checkpoint, restore_checkpoint, save_checkpoint
 from nanorfd.evals import evaluate
 
+##############################################
+# Experiment configuration
+##############################################
 
-# This entry only owns model/optimizer/diffusion choices; experiment settings come from base.
+
 @dataclass(frozen=True, kw_only=True)
 class Config(ExperimentConfig):
     width: int = 256
@@ -48,7 +49,11 @@ class Config(ExperimentConfig):
     rho: float = 7.0
 
 
-# The tokenizer's AtomWorks pipeline selects a trace, then converts it to tensors.
+##############################################
+# AtomWorks tokenizer, collation, and augmentation
+##############################################
+
+
 class SelectCA(Transform):
     def forward(self, data):
         atoms = data["atom_array"]
@@ -106,6 +111,31 @@ class CATokenizer:
         return atoms
 
     @staticmethod
+    def collate(records, device):
+        """Pad already-tokenized records and convert angstroms to nanometers."""
+        coords = [record["coords"] for record in records]
+        x = pad_sequence(coords, batch_first=True).to(device) / 10.0
+        lengths = torch.tensor([len(c) for c in coords], device=device)
+        mask = torch.arange(x.shape[1], device=device)[None, :] < lengths[:, None]
+        return x, mask
+
+    @staticmethod
+    def center(x, mask):
+        """Center valid coordinates and leave padding exactly zero."""
+        x = x.masked_fill(~mask[..., None], 0)
+        mean = x.sum(dim=1, keepdim=True) / mask.sum(dim=1)[:, None, None].clamp_min(1)
+        return (x - mean).masked_fill(~mask[..., None], 0)
+
+    @classmethod
+    def augment(cls, x, mask, cfg):
+        """Center and apply one proper random rotation per protein."""
+        x = cls.center(x, mask)
+        q, r = torch.linalg.qr(torch.randn(len(x), 3, 3, generator=cfg.rng))
+        q *= torch.diagonal(r, dim1=-2, dim2=-1).sign()[:, None, :]
+        q[:, :, 0] *= torch.linalg.det(q)[:, None]
+        return x @ q.to(x.device)
+
+    @staticmethod
     def to_pdb(coords, path):
         coords = CATokenizer.encode(coords)["coords"]
         lines = ["REMARK CA TRACE ONLY; GLY IS A PLACEHOLDER, NOT A DESIGNED SEQUENCE"]
@@ -117,22 +147,21 @@ class CATokenizer:
         Path(path).write_text("\n".join([*lines, "TER", "END", ""]))
 
 
-def file_hash(path):
-    with open(path, "rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+##############################################
+# Dataset preparation
+##############################################
 
 
 def prepare(cfg):
     path = Path(cfg.manifest).resolve()
     manifest = json.loads(path.read_text())
-    data = {"version": 1, "manifest_sha256": file_hash(path)}
+    data = {"version": 1}
     tokenizer = CATokenizer()
     for split, entries in manifest.items():
         data[split] = []
         for entry in entries:
             structure_path = path.parent / entry["path"]
             record = tokenizer.from_file(structure_path, entry.get("chain"))
-            record["source_sha256"] = file_hash(structure_path)
             data[split].append(record)
     output = Path(cfg.data)
     if output.exists():
@@ -142,43 +171,11 @@ def prepare(cfg):
     print(f"Saved {len(data['train'])} training structures to {output}")
 
 
-def center(x, mask):
-    """Center valid coordinates and leave padding exactly zero."""
-    x = x.masked_fill(~mask[..., None], 0)
-    mean = x.sum(dim=1, keepdim=True) / mask.sum(dim=1)[:, None, None].clamp_min(1)
-    return (x - mean).masked_fill(~mask[..., None], 0)
+##############################################
+# Model: RoPE attention and denoiser
+##############################################
 
 
-def coordinate_scale(records):
-    # One training-set RMS per Cartesian coordinate; never normalize each protein's size.
-    total, count = 0.0, 0
-    for record in records:
-        x = record["coords"].double()
-        total += (x - x.mean(0)).square().sum().item()
-        count += x.numel()
-    scale = math.sqrt(total / count)
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("Invalid training coordinate scale")
-    return scale
-
-
-def make_batch(records, batch_size, scale, rng, device, augment=True):
-    indices = torch.randint(len(records), (batch_size,), generator=rng)
-    xs = [records[i]["coords"] for i in indices.tolist()]
-    lengths = torch.tensor([len(x) for x in xs])
-    x = pad_sequence(xs, batch_first=True)
-    mask = torch.arange(x.shape[1])[None, :] < lengths[:, None]
-    x = center(x, mask) / scale
-    if augment:
-        # QR with sign correction gives uniform orthogonal matrices; det=+1 excludes reflections.
-        q, r = torch.linalg.qr(torch.randn(batch_size, 3, 3, generator=rng))
-        q *= torch.diagonal(r, dim1=-2, dim2=-1).sign()[:, None, :]
-        q[:, :, 0] *= torch.linalg.det(q)[:, None]
-        x = x @ q
-    return x.to(device), mask.to(device)
-
-
-# Ordinary padded attention. RoPE uses residue order, not spatial coordinates.
 class Attention(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -253,20 +250,25 @@ class Denoiser(nn.Module):
         return self.output(h).float().masked_fill(~mask[..., None], 0)
 
 
-# EDM in units where training-set sigma_data = 1. All geometric arithmetic is float32.
+# EDM with sigma_data = 1 nm. All geometric arithmetic is float32.
+##############################################
+# Diffusion objective and Euler sampler
+##############################################
+
+
 def denoise(model, x, sigma, mask):
     s = sigma[:, None, None]
     c_in = (1 + s.square()).rsqrt()
     raw = model(x * c_in, sigma.log() / 4, mask)
-    return center(x / (1 + s.square()) + s * c_in * raw, mask)
+    return CATokenizer.center(x / (1 + s.square()) + s * c_in * raw, mask)
 
 
-def diffusion_loss(model, x, mask, cfg, rng):
+def diffusion_loss(model, x, mask, cfg):
     # A dedicated CPU generator owns all stochastic training inputs, including on CUDA.
     # Saving this state makes batch/noise resume exact.
-    log_sigma = torch.randn(len(x), generator=rng) * cfg.log_sigma_std + cfg.log_sigma_mean
+    log_sigma = torch.randn(len(x), generator=cfg.rng) * cfg.log_sigma_std + cfg.log_sigma_mean
     sigma = log_sigma.exp().clamp(cfg.sigma_min, cfg.sigma_max).to(x.device)
-    noise = center(torch.randn(x.shape, generator=rng).to(x.device), mask)
+    noise = CATokenizer.center(torch.randn(x.shape, generator=cfg.rng).to(x.device), mask)
     prediction = denoise(model, x + sigma[:, None, None] * noise, sigma, mask)
     error = (prediction - x).square().masked_fill(~mask[..., None], 0).sum((1, 2))
     error = error / (3 * mask.sum(1))  # Equal weight per protein, regardless of its length.
@@ -274,10 +276,13 @@ def diffusion_loss(model, x, mask, cfg, rng):
 
 
 @torch.no_grad()
-def sample_coordinates(model, lengths, cfg, rng, device):
+def sample_coordinates(model, lengths, cfg, device):
     lengths = torch.as_tensor(lengths, device=device)
     mask = torch.arange(int(lengths.max()), device=device)[None, :] < lengths[:, None]
-    x = center(torch.randn((*mask.shape, 3), generator=rng).to(device), mask) * cfg.sigma_max
+    x = (
+        CATokenizer.center(torch.randn((*mask.shape, 3), generator=cfg.rng).to(device), mask)
+        * cfg.sigma_max
+    )
     ramp = torch.linspace(0, 1, cfg.sample_steps, device=device)
     schedule = (
         cfg.sigma_max ** (1 / cfg.rho)
@@ -286,10 +291,15 @@ def sample_coordinates(model, lengths, cfg, rng, device):
     schedule = torch.cat((schedule, schedule.new_zeros(1)))
     for sigma, next_sigma in pairwise(schedule):
         prediction = denoise(model, x, sigma.expand(len(x)), mask)
-        x = center(x + (next_sigma - sigma) * (x - prediction) / sigma, mask)
+        x = CATokenizer.center(x + (next_sigma - sigma) * (x - prediction) / sigma, mask)
     if not torch.isfinite(x).all():
         raise ValueError("NaN/Inf during sampling")
     return [coords[: int(length)].cpu() for coords, length in zip(x, lengths)]
+
+
+##############################################
+# Runtime and training loop
+##############################################
 
 
 def runtime(cfg):
@@ -319,43 +329,34 @@ def train(cfg):
     started = time.monotonic()
     device = runtime(cfg)
     torch.manual_seed(cfg.seed)
-    data_hash = file_hash(cfg.data)
     data = torch.load(cfg.data, map_location="cpu", weights_only=True)
-    scale = coordinate_scale(data["train"])
     model = Denoiser(cfg).to(device)
     ema = copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    rng = torch.Generator().manual_seed(cfg.seed + 1)
     step = 0
     out = Path(cfg.out_dir)
     if cfg.resume:
-        step = restore_checkpoint(cfg.resume, model, ema, optimizer, rng)
+        step = restore_checkpoint(cfg.resume, model, ema, optimizer, cfg)
     elif (out / "config.json").exists() or (out / "checkpoint.pt").exists():
         raise ValueError(f"Run already exists: {out}; use --resume or a new --out-dir")
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2) + "\n")
-    metadata = {
-        "torch": str(torch.__version__),
-        "atomworks": version("atomworks"),
-        "device": str(device),
-        "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else str(device),
-        "data_sha256": data_hash,
-        "source_sha256": file_hash(__file__),
-        "coordinate_scale_angstrom": scale,
-        "parameters": sum(p.numel() for p in model.parameters()),
-        "train_structures": len(data["train"]),
-    }
-    (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    print(json.dumps(metadata), flush=True)
+    (out / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2) + "\n")
+    print(
+        f"Device: {device} | Parameters: {sum(p.numel() for p in model.parameters()):,}", flush=True
+    )
+    tokenizer = CATokenizer()
     while step < cfg.steps:
         model.train()
-        x, mask = make_batch(data["train"], cfg.batch_size, scale, rng, device)
+        indices = torch.randint(len(data["train"]), (cfg.batch_size,), generator=cfg.rng)
+        records = [data["train"][i] for i in indices.tolist()]
+        x, mask = tokenizer.collate(records, device)
+        x = tokenizer.augment(x, mask, cfg)
         optimizer.zero_grad(set_to_none=True)
         lr = learning_rate(step, cfg)
         for group in optimizer.param_groups:
             group["lr"] = lr
         with autocast(cfg, device):
-            loss = diffusion_loss(model, x, mask, cfg, rng)
+            loss = diffusion_loss(model, x, mask, cfg)
         if not torch.isfinite(loss):
             raise ValueError(f"NaN/Inf loss at step {step}")
         loss.backward()
@@ -371,9 +372,7 @@ def train(cfg):
         if step % cfg.log_every == 0 or save_now:
             row = {"step": step, "train_loss": loss.item(), "lr": lr, "elapsed_seconds": elapsed}
             if save_now:
-                save_checkpoint(
-                    out / "checkpoint.pt", model, ema, optimizer, step, rng, scale, cfg, data_hash
-                )
+                save_checkpoint(out / "checkpoint.pt", model, ema, optimizer, step, cfg)
             with (out / "metrics.jsonl").open("a") as handle:
                 handle.write(json.dumps(row, allow_nan=False) + "\n")
             print(json.dumps(row), flush=True)
@@ -382,33 +381,36 @@ def train(cfg):
     print(f"Checkpoint: {out / 'checkpoint.pt'}", flush=True)
 
 
+##############################################
+# Generation and shared evaluation
+##############################################
+
+
 def sample(cfg):
     device = runtime(cfg)
     state = load_checkpoint(cfg.checkpoint)
     trained = Config(**state["config"])
     model = Denoiser(trained).to(device).eval()
     model.load_state_dict(state["ema"])
-    # The checkpoint owns diffusion units/bounds; inference controls only step count and rho.
-    trained = replace(trained, sample_steps=cfg.sample_steps, rho=cfg.rho)
+    # Outputs are in nm; the tokenizer/export boundary uses angstroms.
+    trained = replace(trained, seed=cfg.seed, sample_steps=cfg.sample_steps, rho=cfg.rho)
     out = Path(cfg.out_dir)
     if (out / "samples.pt").exists():
         raise ValueError(f"Refusing to overwrite samples in {out}")
     out.mkdir(parents=True, exist_ok=True)
-    rng = torch.Generator().manual_seed(cfg.seed)
     records = []
     for start in range(0, cfg.num_samples, cfg.batch_size):
         count = min(cfg.batch_size, cfg.num_samples - start)
         with autocast(cfg, device):
-            coords = sample_coordinates(model, [cfg.length] * count, trained, rng, device)
+            coords = sample_coordinates(model, [cfg.length] * count, trained, device)
         for i, x in enumerate(coords, start):
-            record = CATokenizer.encode(x * state["coordinate_scale"], f"sample_{i:04d}")
+            record = CATokenizer.encode(x * 10.0, f"sample_{i:04d}")
             records.append(record)
     torch.save(
         {
             "version": 1,
             "samples": records,
             "seed": cfg.seed,
-            "checkpoint_sha256": file_hash(cfg.checkpoint),
             "sample_steps": cfg.sample_steps,
             "rho": cfg.rho,
             "batch_size": cfg.batch_size,
@@ -418,6 +420,11 @@ def sample(cfg):
     for record in records:
         CATokenizer.to_pdb(record["coords"], out / f"{record['id']}.pdb")
     evaluate({r["id"]: CATokenizer.decode(r["coords"]) for r in records}, out)
+
+
+##############################################
+# Entry point
+##############################################
 
 
 def main(config: Config):
