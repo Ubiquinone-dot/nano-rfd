@@ -19,10 +19,12 @@ entries/baseline/
   main.py                 worked solution
 entries/template/
   main.py                 assignment scaffold with TODO functions
+entries/baseline_jax/
+  main.py                 functional JAX/Optax solution
 configs/debug.json        small baseline settings
 ```
 
-Each entry folder contains only `main.py`. Both entries extend the frozen
+Each entry folder contains only `main.py`. All entries extend the frozen
 `ExperimentConfig` and expose `main(config)`. The base config supplies data/run paths,
 seed, device/precision, length settings, training budgets, logging/checkpoint cadence,
 and sampling settings. Entries add model, optimizer, and diffusion parameters.
@@ -52,6 +54,51 @@ Dependencies are PyTorch and AtomWorks, with NumPy/Biotite supplied by AtomWorks
 `uv sync` installs `nanorfd` in editable mode, so entry scripts import the shared package
 directly. `auto` selects CUDA if available, otherwise CPU. CUDA uses bfloat16 autocast;
 `--no-bf16` selects float32. CPU and explicit `--device mps` use float32.
+
+## Functional JAX baseline
+
+`entries/baseline_jax/main.py` implements the same architecture, EDM objective, EMA,
+and Euler sampler using JAX and Optax. Model layers are plain functions: `init_model`
+returns a parameter tree, `model` and `denoise` apply it, and `train_step` returns a new
+state. There are no model module classes or hidden parameter/RNG stores. State contains
+parameters, EMA parameters, Adam state, step, and an explicit PRNG key.
+
+```bash
+uv sync --extra jax --python 3.12
+uv run --extra jax python entries/baseline_jax/main.py train --config configs/debug.json --data data/ca.pt --out-dir runs/jax
+uv run --extra jax python entries/baseline_jax/main.py sample --checkpoint runs/jax/checkpoint.npz --out-dir samples/jax --length 64
+uv run --extra jax python entries/baseline_jax/main.py eval --samples samples/jax/samples.pt --out-dir samples/jax
+```
+
+The same `prepare` command and AtomWorks transform pipeline work in this entry. Prepared
+`.pt` datasets and generated `samples.pt` files are interchangeable between entries.
+PyTorch is used only at the CPU tokenizer/file boundary; the model, gradients,
+augmentation, and optimizer updates use JAX. Geometry evaluation is the shared module.
+
+The training update is JIT-compiled, while the sampler uses `jax.lax.scan`. Batches are
+padded to `max_length` to keep their compiled shape fixed; curate data within that length.
+Only the current batch is transferred to the accelerator. Compilation counts toward the
+training time budget. CPU uses float32; GPU uses bfloat16 model computations by default
+with float32 parameters, optimizer state, and diffusion arithmetic. JAX manages CPU
+threading itself; the shared `threads` setting is not applied to XLA.
+
+The `jax` extra installs the CPU-capable packages. For NVIDIA GPU training, install the
+matching JAX accelerator packages using the [official JAX installation guide](https://docs.jax.dev/en/latest/installation.html),
+then run `.venv/bin/python entries/baseline_jax/main.py ... --device cuda` in that
+environment. `--device cpu`, `--device gpu`, and `--device auto` are also supported.
+This entry has been tested on CPU; GPU throughput and the one-hour target remain unmeasured.
+
+JAX checkpoints are `checkpoint.npz`, containing numeric tree leaves and JSON metadata.
+Resume with the same dataset, configuration, and library versions:
+
+```bash
+uv run --extra jax python entries/baseline_jax/main.py train --config runs/jax/config.json --resume runs/jax/checkpoint.npz
+```
+
+Model checkpoints are specific to their backend. With matching weights, the denoiser
+forward pass and gradients agree with PyTorch within numerical tolerance. The two backends
+use different random generators and need not follow identical training trajectories.
+Exact interrupted/resumed CPU training is tested independently for both.
 
 ## Assignment
 
@@ -186,11 +233,13 @@ These are coarse geometry diagnostics; folding-based designability is not implem
 ## Tests
 
 ```bash
-uv run pytest -q
+uv run --extra jax pytest -q
 uv run ruff check src entries tests
 ```
 
 Tests cover AtomWorks loading, chain selection, rotations, RoPE, padding isolation,
 finite gradients, sampler endpoints, exact CPU resume, and shared geometry reports.
+The optional JAX tests also check forward/gradient parity with PyTorch; they skip when
+JAX/Optax are not installed.
 Synthetic helices test correctness rather than protein-generation quality.
 The broader research proposal and Foundry audit are in [PLAN.md](PLAN.md).

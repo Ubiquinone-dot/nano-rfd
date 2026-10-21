@@ -5,6 +5,9 @@ description = "Small C-alpha diffusion experiments with shared evaluation settin
 requires-python = ">=3.11"
 dependencies = ["torch>=2.6", "atomworks>=3.0.4,<4"]
 
+[project.optional-dependencies]
+jax = ["jax>=0.6", "optax>=0.2.4"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
