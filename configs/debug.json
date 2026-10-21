@@ -1,0 +1,16 @@
+{
+  "width": 64,
+  "depth": 2,
+  "heads": 4,
+  "mlp_ratio": 2,
+  "batch_size": 4,
+  "steps": 200,
+  "warmup_steps": 10,
+  "eval_every": 50,
+  "eval_batches": 2,
+  "log_every": 25,
+  "max_minutes": 0,
+  "length": 16,
+  "num_samples": 4,
+  "sample_steps": 16
+}
